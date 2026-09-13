@@ -17,7 +17,7 @@ python -m pip install -r requirements.txt
 
 ## 主要入口
 
-- `src/collector_v0_3_1.py`：長時間收集器（目前 `watchlist.json` 使用的版本）。
+- `src/collector.py`：長時間收集器（目前 `watchlist.json` 使用的版本）。
 - data/raw/<session>/raw_events.ndjson：保留 SDK 通用 event callback 的完整原始 payload。
 - `src/watcher.py`：依 `watchlist.json` 探測直播並啟停收集器。
 - `src/analyzer.py`：將 `events.ndjson` 彙總成時間序列 CSV 與摘要 JSON。
@@ -27,7 +27,7 @@ python -m pip install -r requirements.txt
 範例：
 
 ```powershell
-python src\collector_v0_3_1.py <username>
+python src\collector.py <username>
 python src\watcher.py --config watchlist.json
 python -m streamlit run app\dashboard.py --server.address 127.0.0.1 --server.port 8501
 python src\analyzer.py data\raw\<session>
@@ -49,6 +49,13 @@ git -C tiktok-live-events status
 ```
 
 目前不會自動提交、推送或修改巢狀 SDK 倉庫的既有變更。
+## Runtime behavior
+
+- Watcher log timestamps use Asia/Taipei; event/session files keep both UTC and local timestamps.
+- probe_timeout and HTTP 429 are non-authoritative. When no collector is active, the watcher starts a resilient collector candidate that keeps retrying with exponential backoff (up to 60 seconds).
+- Only the SDK response is not currently live is treated as authoritative offline.
+- Legacy collector versions are kept under src/legacy/; src/collector.py is the only supported collector entry point.
+
 ## Dashboard 與記錄
 
 啟動 Streamlit：

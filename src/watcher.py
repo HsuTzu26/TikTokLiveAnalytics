@@ -8,15 +8,20 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-
+from zoneinfo import ZoneInfo
 from tiktok_live_events import TikTokLive
 
 
-WATCHER_VERSION = "0.1"
+WATCHER_VERSION = "0.2"
+TAIPEI_TZ = ZoneInfo("Asia/Taipei")
 
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def taipei_now():
+    return datetime.now(TAIPEI_TZ).isoformat()
 
 
 def load_config(path):
@@ -26,10 +31,12 @@ def load_config(path):
         "poll_seconds": 60,
         "probe_timeout_seconds": 15,
         "offline_confirmations": 3,
-        "collector_script": "src/collector_v0_3_1.py",
+        "collector_script": "src/collector.py",
         "output_root": "data/raw",
         "restart_collector_on_crash": True,
         "restart_delay_seconds": 10,
+        "start_collector_on_probe_error": True,
+        "collector_probe_error_cooldown_seconds": 300,
         "streamers": [],
     }
 
@@ -161,6 +168,7 @@ class Watcher:
             }
 
         self.processes = {}
+        self.fallback_last_started = {}
         self.running = True
 
     def acquire_pid(self):
@@ -191,7 +199,8 @@ class Watcher:
             self.pid_path.unlink(missing_ok=True)
 
     def log(self, message):
-        line = f"{utc_now()} {message}"
+        # Human-facing watcher logs use Taiwan time; state fields retain UTC.
+        line = f"{taipei_now()} {message}"
         print(line, flush=True)
         with self.log_path.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
@@ -265,6 +274,24 @@ class Watcher:
             f"room={room_id or 'unknown'} "
             f"pid={process.pid}"
         )
+
+    def should_start_probe_error_fallback(self, username, error):
+        if not self.config.get("start_collector_on_probe_error", True):
+            return False
+        text = str(error or "").lower()
+        # This is the only authoritative negative returned by the SDK. A
+        # timeout, 429, or transport error must not prevent collection.
+        if "is not currently live" in text:
+            return False
+        now = time.monotonic()
+        cooldown = float(
+            self.config.get("collector_probe_error_cooldown_seconds", 300)
+        )
+        previous = self.fallback_last_started.get(username)
+        if previous is not None and now - previous < cooldown:
+            return False
+        self.fallback_last_started[username] = now
+        return True
 
     def stop_collector(self, username, reason):
         process = self.processes.get(username)
@@ -407,6 +434,15 @@ class Watcher:
                 f"[KEEP] @{username} collector pid={process.pid} "
                 "kept alive despite probe miss"
             )
+            return
+
+        if self.should_start_probe_error_fallback(username, result["error"]):
+            self.start_collector(username)
+            state["status"] = "connecting"
+            self.log(
+                f"[FALLBACK] @{username} collector started without LIVE probe; "
+                "probe error is non-authoritative"
+            )
 
     def shutdown(self):
         self.log("[WATCHER] shutting down")
@@ -444,7 +480,10 @@ class Watcher:
             f"[CONFIG] poll={self.config['poll_seconds']}s "
             f"probe_timeout={self.config['probe_timeout_seconds']}s "
             f"offline_confirmations="
-            f"{self.config['offline_confirmations']}"
+            f"{self.config['offline_confirmations']} "
+            f"timezone=Asia/Taipei "
+            f"probe_error_fallback="
+            f"{self.config.get('start_collector_on_probe_error', True)}"
         )
 
         try:

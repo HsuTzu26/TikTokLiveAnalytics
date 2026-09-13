@@ -1,1 +1,1 @@
-.\.venv\Scripts\python.exe src\collector_v0_3_1.py rr306gg89
+.\.venv\Scripts\python.exe src\collector.py rr306gg89

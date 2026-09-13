@@ -152,7 +152,9 @@ def load_session(session_dir: Path | None):
             elif event_type == "chat":
                 summary["chat"] += 1
                 summary["recent_chat"].append({
-                    "time": event.get("received_at_utc")
+                    "time": event.get("received_at_local")
+                    or event.get("timestamp_local")
+                    or event.get("received_at_utc")
                     or event.get("timestamp_utc"),
                     "user": event.get("unique_id") or event.get("nickname"),
                     "comment": event.get("comment"),
@@ -173,6 +175,7 @@ def render_dashboard():
     states = state.get("streamers", {})
 
     st.title("TikTok LIVE Analytics")
+    st.caption("Display timezone: Asia/Taipei")
     st.caption("Watcher / Collector / Dashboard 分離；Streamlit 不持有 TikTok WebSocket。")
 
     with st.sidebar:
