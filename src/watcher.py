@@ -26,7 +26,7 @@ def load_config(path):
         "poll_seconds": 60,
         "probe_timeout_seconds": 15,
         "offline_confirmations": 3,
-        "collector_script": "src/collector_v0_3.py",
+        "collector_script": "src/collector_v0_3_1.py",
         "output_root": "data/raw",
         "restart_collector_on_crash": True,
         "restart_delay_seconds": 10,
@@ -141,6 +141,8 @@ class Watcher:
 
         self.log_path = self.log_dir / "watcher.log"
         self.state_path = self.log_dir / "watcher_state.json"
+        self.pid_path = self.log_dir / "watcher.pid"
+        self.stop_path = self.log_dir / "watcher.stop"
 
         self.states = {}
         for item in self.config["streamers"]:
@@ -160,6 +162,33 @@ class Watcher:
 
         self.processes = {}
         self.running = True
+
+    def acquire_pid(self):
+        current_pid = os.getpid()
+        try:
+            existing_pid = int(self.pid_path.read_text(encoding="ascii").strip())
+        except (FileNotFoundError, ValueError, OSError):
+            existing_pid = None
+
+        if existing_pid and existing_pid != current_pid:
+            try:
+                os.kill(existing_pid, 0)
+            except OSError:
+                pass
+            else:
+                raise SystemExit(
+                    f"Watcher already running (PID {existing_pid})"
+                )
+
+        self.pid_path.write_text(str(current_pid), encoding="ascii")
+
+    def release_pid(self):
+        try:
+            current_pid = int(self.pid_path.read_text(encoding="ascii").strip())
+        except (FileNotFoundError, ValueError, OSError):
+            return
+        if current_pid == os.getpid():
+            self.pid_path.unlink(missing_ok=True)
 
     def log(self, message):
         line = f"{utc_now()} {message}"
@@ -369,18 +398,14 @@ class Watcher:
         )
 
         process = self.processes.get(username)
-        if (
-            process is not None
-            and process.poll() is None
-            and state["consecutive_misses"]
-            >= self.config["offline_confirmations"]
-        ):
-            self.stop_collector(
-                username,
-                reason=(
-                    f"{state['consecutive_misses']} "
-                    "consecutive LIVE probe misses"
-                ),
+        if process is not None and process.poll() is None:
+            # Probe failures are not authoritative offline signals. The
+            # collector owns the WebSocket and must continue through transient
+            # timeouts, 429s, and probe endpoint failures.
+            state["status"] = "collecting"
+            self.log(
+                f"[KEEP] @{username} collector pid={process.pid} "
+                "kept alive despite probe miss"
             )
 
     def shutdown(self):
@@ -393,6 +418,8 @@ class Watcher:
             )
 
         self.save_state()
+        self.stop_path.unlink(missing_ok=True)
+        self.release_pid()
 
     def run(self):
         enabled = [
@@ -405,6 +432,8 @@ class Watcher:
                 "No enabled streamers in watchlist.json"
             )
 
+        self.acquire_pid()
+        self.stop_path.unlink(missing_ok=True)
         self.log(
             "[WATCHER] started | "
             + ", ".join(
@@ -422,17 +451,33 @@ class Watcher:
             while self.running:
                 cycle_started = time.monotonic()
 
+                if self.stop_path.exists():
+                    self.log("[WATCHER] stop requested")
+                    self.running = False
+                    break
+
                 self.check_crashed_collectors()
 
-                results = asyncio.run(
-                    probe_all(
-                        enabled,
-                        self.config["probe_timeout_seconds"],
+                # Do not probe a streamer while its collector is healthy.
+                # Probe failures (429/timeout) are not proof that a LIVE ended
+                # and must never stop an active collection process.
+                probe_targets = [
+                    item for item in enabled
+                    if not (
+                        self.processes.get(item["username"])
+                        and self.processes[item["username"]].poll() is None
                     )
-                )
+                ]
+                if probe_targets:
+                    results = asyncio.run(
+                        probe_all(
+                            probe_targets,
+                            self.config["probe_timeout_seconds"],
+                        )
+                    )
 
-                for result in results:
-                    self.apply_probe(result)
+                    for result in results:
+                        self.apply_probe(result)
 
                 self.save_state()
 
@@ -442,6 +487,10 @@ class Watcher:
                     self.config["poll_seconds"] - elapsed,
                 )
 
+                if self.stop_path.exists():
+                    self.log("[WATCHER] stop requested")
+                    self.running = False
+                    break
                 time.sleep(sleep_seconds)
 
         except KeyboardInterrupt:

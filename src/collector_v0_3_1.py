@@ -5,6 +5,7 @@ import json
 import platform
 import re
 import signal
+import sys
 import time
 from collections import Counter, deque
 from datetime import datetime, timezone
@@ -18,6 +19,24 @@ from tiktok_live_events import TikTokLive
 COLLECTOR_VERSION = "0.3"
 SCHEMA_VERSION = "0.3"
 DEFAULT_TIMEZONE = "Asia/Taipei"
+
+
+class TeeStream:
+    """Mirror collector stdout/stderr to the per-session log file."""
+
+    def __init__(self, primary, log_fp):
+        self.primary = primary
+        self.log_fp = log_fp
+
+    def write(self, data):
+        self.primary.write(data)
+        self.log_fp.write(data)
+        self.flush()
+
+    def flush(self):
+        self.primary.flush()
+        self.log_fp.flush()
+
 
 
 def now_ms():
@@ -335,6 +354,7 @@ def main():
     users_path = session_dir / "users.ndjson"
     diagnostics_path = session_dir / "diagnostics.ndjson"
     session_path = session_dir / "session.json"
+    collector_log_path = session_dir / "collector.log"
 
     events_fp = events_path.open(
         "a", encoding="utf-8", buffering=1
@@ -348,6 +368,13 @@ def main():
     diagnostics_fp = diagnostics_path.open(
         "a", encoding="utf-8", buffering=1
     )
+    collector_log_fp = collector_log_path.open(
+        "a", encoding="utf-8", buffering=1
+    )
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    sys.stdout = TeeStream(original_stdout, collector_log_fp)
+    sys.stderr = TeeStream(original_stderr, collector_log_fp)
 
     state = {
         "seq": 0,
@@ -363,6 +390,7 @@ def main():
         "duplicate_event_counts": Counter(),
         "rate_limited": False,
         "error_event_count": 0,
+        "live_end_detected": False,
         "raw_event_count": 0,
     }
 
@@ -414,6 +442,8 @@ def main():
         "event_counts": {},
         "raw_event_file": raw_events_path.name,
         "raw_event_count": 0,
+        "collector_log_file": collector_log_path.name,
+        "live_end_detected": False,
         "last_received_at_utc": None,
         "environment": {
             "python": platform.python_version(),
@@ -949,6 +979,23 @@ def main():
     def on_any_event(e):
         write_raw_event(e)
 
+    @live.on("live_end")
+    def on_live_end(e):
+        event = e or {}
+        state["live_end_detected"] = True
+        session_meta["live_end_detected"] = True
+        write_event({
+            "type": "system",
+            "system_event": "live_end",
+            "timestamp_ms": event.get("timestamp"),
+            "timestamp_utc": iso_utc_from_ms(event.get("timestamp")),
+            "timestamp_local": iso_local_from_ms(
+                event.get("timestamp"), local_tz
+            ),
+            "received_at_ms": now_ms(),
+        })
+        live.stop()
+
     @live.on("error")
     def on_error(e):
         e = e or {}
@@ -1044,6 +1091,9 @@ def main():
 
             await live.run()
 
+            if state["live_end_detected"]:
+                return
+
             if state["rate_limited"]:
                 return
 
@@ -1063,7 +1113,9 @@ def main():
 
     try:
         asyncio.run(run_resilient())
-        if state["rate_limited"]:
+        if state["live_end_detected"]:
+            exit_status = "live_end"
+        elif state["rate_limited"]:
             exit_status = "rate_limited"
     except KeyboardInterrupt:
         exit_status = "stopped_by_user"
@@ -1166,6 +1218,12 @@ def main():
             f"[uptime]  "
             f"{session_meta['data_quality']['socket_uptime_ratio']}"
         )
+
+        sys.stdout.flush()
+        sys.stderr.flush()
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        collector_log_fp.close()
 
 
 

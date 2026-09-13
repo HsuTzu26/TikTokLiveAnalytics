@@ -29,6 +29,7 @@ python -m pip install -r requirements.txt
 ```powershell
 python src\collector_v0_3_1.py <username>
 python src\watcher.py --config watchlist.json
+python -m streamlit run app\dashboard.py
 python src\analyzer.py data\raw\<session>
 python src\validate_session.py data\raw\<session>
 python src\plot_session.py data\raw\<session>
@@ -48,3 +49,13 @@ git -C tiktok-live-events status
 ```
 
 目前不會自動提交、推送或修改巢狀 SDK 倉庫的既有變更。
+## Dashboard 與記錄
+
+啟動 Streamlit：
+
+```powershell
+python -m streamlit run app\dashboard.py
+```
+
+每個 session 會產生 `collector.log`；Watcher 會寫入 `data/watcher/watcher.log`。
+Probe timeout 或 HTTP 429 只會記錄並保留健康 Collector，不會觸發停止。
