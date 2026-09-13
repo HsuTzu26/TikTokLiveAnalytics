@@ -29,7 +29,7 @@ python -m pip install -r requirements.txt
 ```powershell
 python src\collector_v0_3_1.py <username>
 python src\watcher.py --config watchlist.json
-python -m streamlit run app\dashboard.py
+python -m streamlit run app\dashboard.py --server.address 127.0.0.1 --server.port 8501
 python src\analyzer.py data\raw\<session>
 python src\validate_session.py data\raw\<session>
 python src\plot_session.py data\raw\<session>
@@ -54,7 +54,7 @@ git -C tiktok-live-events status
 啟動 Streamlit：
 
 ```powershell
-python -m streamlit run app\dashboard.py
+python -m streamlit run app\dashboard.py --server.address 127.0.0.1 --server.port 8501
 ```
 
 每個 session 會產生 `collector.log`；Watcher 會寫入 `data/watcher/watcher.log`。
