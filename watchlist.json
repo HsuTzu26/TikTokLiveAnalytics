@@ -1,0 +1,21 @@
+{
+  "poll_seconds": 60,
+  "probe_timeout_seconds": 15,
+  "offline_confirmations": 3,
+  "collector_script": "src/collector_v0_3_1.py",
+  "output_root": "data/raw",
+  "restart_collector_on_crash": true,
+  "restart_delay_seconds": 10,
+  "streamers": [
+    {
+      "username": "rr306gg89",
+      "label": "rr306gg89",
+      "enabled": false
+    },
+    {
+      "username": "chloe_o723_",
+      "label": "chloe_o723_",
+      "enabled": true
+    }
+  ]
+}

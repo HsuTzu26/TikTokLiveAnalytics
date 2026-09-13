@@ -1,0 +1,5 @@
+# Local SDK used by the collectors (editable install keeps source changes visible).
+-e ./tiktok-live-events/python
+
+# Plot generation dependency; the SDK installs websockets as a transitive dependency.
+matplotlib>=3.11,<4

@@ -1,0 +1,27 @@
+# Python environments and caches
+.venv/
+.venv_tiktoklive/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local configuration and build artefacts
+.env
+*.egg-info/
+build/
+dist/
+
+# Captured LIVE data, watcher state/logs, and generated analysis output
+data/
+*.7z
+
+# The SDK is an independent Git repository with its own history.
+/tiktok-live-events/
+
+# Local editor/OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
