@@ -18,6 +18,7 @@ python -m pip install -r requirements.txt
 ## 主要入口
 
 - `src/collector_v0_3_1.py`：長時間收集器（目前 `watchlist.json` 使用的版本）。
+- data/raw/<session>/raw_events.ndjson：保留 SDK 通用 event callback 的完整原始 payload。
 - `src/watcher.py`：依 `watchlist.json` 探測直播並啟停收集器。
 - `src/analyzer.py`：將 `events.ndjson` 彙總成時間序列 CSV 與摘要 JSON。
 - `src/validate_session.py`：檢查禮物連刷與 diamond 計算一致性。

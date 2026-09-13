@@ -331,11 +331,15 @@ def main():
     session_dir.mkdir(parents=True, exist_ok=True)
 
     events_path = session_dir / "events.ndjson"
+    raw_events_path = session_dir / "raw_events.ndjson"
     users_path = session_dir / "users.ndjson"
     diagnostics_path = session_dir / "diagnostics.ndjson"
     session_path = session_dir / "session.json"
 
     events_fp = events_path.open(
+        "a", encoding="utf-8", buffering=1
+    )
+    raw_events_fp = raw_events_path.open(
         "a", encoding="utf-8", buffering=1
     )
     users_fp = users_path.open(
@@ -359,6 +363,7 @@ def main():
         "duplicate_event_counts": Counter(),
         "rate_limited": False,
         "error_event_count": 0,
+        "raw_event_count": 0,
     }
 
     session_meta = {
@@ -407,6 +412,8 @@ def main():
             "room",
         ],
         "event_counts": {},
+        "raw_event_file": raw_events_path.name,
+        "raw_event_count": 0,
         "last_received_at_utc": None,
         "environment": {
             "python": platform.python_version(),
@@ -429,6 +436,7 @@ def main():
         session_meta["duplicate_event_counts"] = dict(
             state["duplicate_event_counts"]
         )
+        session_meta["raw_event_count"] = state["raw_event_count"]
 
         tmp = session_path.with_suffix(".json.tmp")
         tmp.write_text(
@@ -556,6 +564,34 @@ def main():
 
         maybe_checkpoint()
         return True
+
+    def write_raw_event(event):
+        """Persist every SDK event before type-specific normalization."""
+        if not isinstance(event, dict):
+            return
+
+        received = now_ms()
+        row = {
+            "schema_version": SCHEMA_VERSION,
+            "session_id": session_id,
+            "room_id": state["room_id"],
+            "connection_id": state["connection_id"],
+            "received_at_ms": received,
+            "received_at_utc": iso_utc_from_ms(received),
+            "received_at_local": iso_local_from_ms(
+                received, local_tz
+            ),
+            "event_type": event.get("type"),
+            "timestamp_ms": event.get("timestamp"),
+            "msg_id": event.get("msgId"),
+            "payload": event,
+        }
+
+        raw_events_fp.write(
+            json.dumps(row, ensure_ascii=False) + "\n"
+        )
+        raw_events_fp.flush()
+        state["raw_event_count"] += 1
 
     def base_record(event, event_type):
         received = now_ms()
@@ -909,6 +945,10 @@ def main():
         }
         write_event(record)
 
+    @live.on("event")
+    def on_any_event(e):
+        write_raw_event(e)
+
     @live.on("error")
     def on_error(e):
         e = e or {}
@@ -1110,6 +1150,7 @@ def main():
         maybe_checkpoint(force=True)
 
         events_fp.close()
+        raw_events_fp.close()
         users_fp.close()
         diagnostics_fp.close()
 
