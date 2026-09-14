@@ -151,25 +151,58 @@ class Watcher:
         self.pid_path = self.log_dir / "watcher.pid"
         self.stop_path = self.log_dir / "watcher.stop"
 
-        self.states = {}
-        for item in self.config["streamers"]:
-            self.states[item["username"]] = {
-                "label": item["label"],
-                "enabled": item["enabled"],
-                "status": "waiting",
-                "last_probe_at_utc": None,
-                "last_confirmed_live_at_utc": None,
-                "last_room_id": None,
-                "consecutive_misses": 0,
-                "collector_pid": None,
-                "collector_started_at_utc": None,
-                "collector_restart_count": 0,
-                "last_probe_error": None,
-            }
+        self.states = {
+            item["username"]: self._initial_state(item)
+            for item in self.config["streamers"]
+        }
 
         self.processes = {}
         self.fallback_last_started = {}
         self.running = True
+
+    @staticmethod
+    def _initial_state(item):
+        return {
+            "label": item["label"],
+            "enabled": item["enabled"],
+            "status": "waiting",
+            "last_probe_at_utc": None,
+            "last_confirmed_live_at_utc": None,
+            "last_room_id": None,
+            "consecutive_misses": 0,
+            "collector_pid": None,
+            "collector_started_at_utc": None,
+            "collector_restart_count": 0,
+            "last_probe_error": None,
+        }
+
+    def sync_config(self):
+        try:
+            latest = load_config(self.config_path)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            self.log(f"[WARN] watchlist reload failed: {exc}")
+            return
+
+        self.config = latest
+        configured = {
+            item["username"]: item for item in latest["streamers"]
+        }
+        for username, item in configured.items():
+            if username not in self.states:
+                self.states[username] = self._initial_state(item)
+                self.log(f"[WATCH] added @{username}")
+            else:
+                self.states[username]["label"] = item["label"]
+                self.states[username]["enabled"] = item["enabled"]
+
+        for username, state in self.states.items():
+            if username not in configured:
+                state["enabled"] = False
+            if state["enabled"]:
+                continue
+            process = self.processes.get(username)
+            if process is not None and process.poll() is None:
+                self.stop_collector(username, reason="watchlist_disabled")
 
     def acquire_pid(self):
         current_pid = os.getpid()
@@ -465,18 +498,13 @@ class Watcher:
             if s["enabled"]
         ]
 
-        if not enabled:
-            raise SystemExit(
-                "No enabled streamers in watchlist.json"
-            )
-
         self.acquire_pid()
         self.stop_path.unlink(missing_ok=True)
         self.log(
             "[WATCHER] started | "
-            + ", ".join(
+            + (", ".join(
                 f"@{s['username']}" for s in enabled
-            )
+            ) if enabled else "no enabled streamers")
         )
         self.log(
             f"[CONFIG] poll={self.config['poll_seconds']}s "
@@ -497,6 +525,11 @@ class Watcher:
                     self.running = False
                     break
 
+                self.sync_config()
+                enabled = [
+                    s for s in self.config["streamers"]
+                    if s["enabled"]
+                ]
                 self.check_crashed_collectors()
 
                 # Do not probe a streamer while its collector is healthy.

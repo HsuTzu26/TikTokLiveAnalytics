@@ -292,6 +292,48 @@ def render_activity_chart(rows: list[dict]):
     st.altair_chart(chart, use_container_width=True)
 
 
+def add_streamer_to_watchlist(raw_username: str) -> str:
+    username = raw_username.strip().lstrip("@").strip()
+    if not username:
+        return "Enter a streamer username first."
+
+    config = read_json(CONFIG_PATH, {
+        "poll_seconds": 60,
+        "probe_timeout_seconds": 15,
+        "offline_confirmations": 3,
+        "collector_script": "src/collector.py",
+        "output_root": "data/raw",
+        "streamers": [],
+    })
+    streamers = config.setdefault("streamers", [])
+    found = None
+    for item in streamers:
+        if str(item.get("username", "")).lstrip("@").strip() == username:
+            found = item
+            break
+
+    if found is None:
+        streamers.append({
+            "username": username,
+            "label": username,
+            "enabled": True,
+        })
+        action = "added"
+    else:
+        found["username"] = username
+        found["label"] = found.get("label") or username
+        found["enabled"] = True
+        action = "enabled"
+
+    tmp = CONFIG_PATH.with_suffix(".json.tmp")
+    tmp.write_text(
+        json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    tmp.replace(CONFIG_PATH)
+    return f"@{username} {action} to watchlist. Watcher will probe it on the next cycle."
+
+
 def render_dashboard():
     config = read_json(CONFIG_PATH, {"streamers": []})
     state = read_json(WATCHER_STATE, {"streamers": {}})
@@ -317,6 +359,17 @@ def render_dashboard():
             st.rerun()
         if st.button("Stop watcher", disabled=not running, use_container_width=True):
             st.warning(stop_watcher())
+            st.rerun()
+
+        st.divider()
+        st.header("Track a streamer")
+        new_streamer = st.text_input(
+            "Streamer username",
+            placeholder="@username",
+            key="new_streamer_username",
+        )
+        if st.button("Add / enable streamer", use_container_width=True):
+            st.success(add_streamer_to_watchlist(new_streamer))
             st.rerun()
 
         st.divider()
