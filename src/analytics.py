@@ -65,6 +65,10 @@ def session_summary(session_dir: Path):
     end = max(timestamps) if timestamps else None
     diamonds = sum(float(event.get("diamond_total") or 0) for event in gifts)
     likes_received = sum(int(event.get("like_count") or 0) for event in likes)
+    like_totals = [int(event["total_likes"]) for event in likes if isinstance(event.get("total_likes"), (int, float))]
+    likes_current_total = max(like_totals) if like_totals else None
+    likes_first_total = like_totals[0] if like_totals else None
+    likes_baseline_estimate = max(0, likes_first_total - int(likes[0].get("like_count") or 0)) if like_totals else None
     actions = Counter(str(event.get("social_action") or "unknown") for event in social)
     return {
         "session_id": str(meta.get("session_id") or session_dir.name),
@@ -84,7 +88,10 @@ def session_summary(session_dir: Path):
         "chat_messages": len(chats),
         "unique_chatters": len({user_id(event) for event in chats}),
         "like_events": len(likes),
+        "likes_observed": likes_received,
         "likes_received": likes_received,
+        "likes_current_total": likes_current_total,
+        "likes_baseline_estimate": likes_baseline_estimate,
         "gift_events": len(gifts),
         "unique_gifters": len({user_id(event) for event in gifts}),
         "total_diamonds": diamonds,

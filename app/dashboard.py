@@ -173,6 +173,10 @@ def load_session(session_dir: Path | None):
         "viewer_rows": [],
         "activity_rows": [],
         "likes": 0,
+        "likes_observed": 0,
+        "like_current_total": None,
+        "like_first_total": None,
+        "like_baseline_estimate": None,
         "diamonds": 0,
         "chat": 0,
         "joins": 0,
@@ -215,7 +219,18 @@ def load_session(session_dir: Path | None):
                         "viewer_count": value,
                     })
             elif event_type == "like":
-                summary["likes"] += event.get("like_count", 0) or 0
+                batch_count = int(event.get("like_count", 0) or 0)
+                summary["likes_observed"] += batch_count
+                summary["likes"] = summary["likes_observed"]
+                total_likes = event.get("total_likes")
+                if isinstance(total_likes, (int, float)):
+                    total_likes = int(total_likes)
+                    if summary["like_first_total"] is None:
+                        summary["like_first_total"] = total_likes
+                        summary["like_baseline_estimate"] = max(0, total_likes - batch_count)
+                    current = summary["like_current_total"]
+                    summary["like_current_total"] = max(current or 0, total_likes)
+                    summary["likes"] = summary["like_current_total"]
             elif event_type == "gift" and event.get("counted"):
                 summary["gifts"] += 1
                 summary["diamonds"] += event.get("diamond_total", 0) or 0
@@ -347,8 +362,9 @@ def render_compare_tab(session_paths: list[Path]):
     columns = [
         "session_id", "status", "first_event_local", "last_event_local",
         "observed_duration_seconds", "peak_viewers", "average_viewers",
-        "chat_messages", "unique_chatters", "likes_received",
-        "total_diamonds", "members", "follows", "shares", "subscribes",
+        "chat_messages", "unique_chatters", "likes_observed",
+        "likes_current_total", "total_diamonds", "members", "follows",
+        "shares", "subscribes",
     ]
     st.dataframe(
         frame[[column for column in columns if column in frame]],
@@ -358,7 +374,8 @@ def render_compare_tab(session_paths: list[Path]):
     metric_options = {
         "Peak viewers": "peak_viewers",
         "Average viewers": "average_viewers",
-        "Likes": "likes_received",
+        "Observed likes": "likes_observed",
+        "Current likes": "likes_current_total",
         "Diamonds": "total_diamonds",
         "Members": "members",
         "Follows": "follows",
@@ -655,14 +672,20 @@ def render_dashboard():
         st.info("No captured session is available for this streamer.")
         return
 
-    cols = st.columns(7)
+    cols = st.columns(8)
     cols[0].metric("Watch status", streamer_state.get("status", "unknown"))
     cols[1].metric("Current viewer", metrics["viewers"][-1] if metrics["viewers"] else "N/A")
     cols[2].metric("Peak viewer", max(metrics["viewers"]) if metrics["viewers"] else "N/A")
     cols[3].metric("Chat", metrics["chat"])
-    cols[4].metric("Likes", metrics["likes"])
-    cols[5].metric("Diamonds", metrics["diamonds"])
-    cols[6].metric("Members", metrics["joins"])
+    cols[4].metric("Current likes", metrics["like_current_total"] if metrics["like_current_total"] is not None else metrics["likes"])
+    cols[5].metric("Observed likes", metrics["likes_observed"])
+    cols[6].metric("Diamonds", metrics["diamonds"])
+    cols[7].metric("Members", metrics["joins"])
+    if metrics["like_current_total"] is not None:
+        st.caption(
+            "Like total uses TikTok totalLikes; observed likes is the batch increment "
+            f"captured by this collector. Estimated pre-capture likes: {metrics['like_baseline_estimate']}."
+        )
 
     tab_overview, tab_chat, tab_compare, tab_gifts, tab_traffic, tab_health, tab_quality = st.tabs(
         [
