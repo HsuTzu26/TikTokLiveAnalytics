@@ -119,7 +119,15 @@ def resolve_session(manual_id: str, username: str, selected_id: str) -> Path | N
         candidate = RAW_ROOT / manual_id
         if candidate.is_dir() and (candidate / "session.json").exists():
             return candidate
-        return None
+
+        # Also accept a TikTok room_id and resolve it to the newest matching
+        # captured session for the selected streamer.
+        matches = []
+        for path in session_dirs(username):
+            meta = read_json(path / "session.json", {})
+            if str(meta.get("room_id") or "") == manual_id:
+                matches.append(path)
+        return matches[0] if matches else None
 
     if selected_id:
         candidate = RAW_ROOT / selected_id
@@ -320,9 +328,9 @@ def render_dashboard():
             key="analysis_username",
         )
         manual_id = st.text_input(
-            "Session ID (optional)",
-            placeholder="20260913_195928_chloe_o723_",
-            help="Enter a folder/session ID to analyze exactly that LIVE.",
+            "Session ID or room ID (optional)",
+            placeholder="20260913_195928_chloe_o723_ or 7684970432562875157",
+            help="Enter a folder Session ID or TikTok room_id to select the LIVE.",
             key="analysis_manual_id",
         )
         available = session_dirs(username) if username else []
@@ -344,7 +352,7 @@ def render_dashboard():
 
     session_dir = resolve_session(manual_id, username, selected_id)
     if manual_id.strip() and session_dir is None:
-        st.error(f"Session ID not found: {manual_id.strip()}")
+        st.error(f"Session ID / room ID not found: {manual_id.strip()}")
         return
     metrics = load_session(session_dir)
     session = metrics["session"] or {}
