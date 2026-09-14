@@ -12,19 +12,23 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-from src.analytics import (
-    audience_metrics,
-    build_health_report,
-    compare_sessions,
-    gift_activity_by_minute,
-    gift_concentration,
-    gift_detail,
-    gift_leaderboard,
-    social_activity_by_minute,
-    social_conversion_proxies,
-    social_summary,
-    traffic_sources,
-)
+# Streamlit reruns scripts in a long-lived process. Reload the local analytics
+# module so newly added functions do not remain hidden behind Python's module cache.
+import importlib
+import src.analytics as analytics_module
+
+analytics_module = importlib.reload(analytics_module)
+audience_metrics = analytics_module.audience_metrics
+build_health_report = analytics_module.build_health_report
+compare_sessions = analytics_module.compare_sessions
+gift_activity_by_minute = analytics_module.gift_activity_by_minute
+gift_concentration = analytics_module.gift_concentration
+gift_detail = analytics_module.gift_detail
+gift_leaderboard = analytics_module.gift_leaderboard
+social_activity_by_minute = analytics_module.social_activity_by_minute
+social_conversion_proxies = analytics_module.social_conversion_proxies
+social_summary = analytics_module.social_summary
+traffic_sources = analytics_module.traffic_sources
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -140,6 +144,30 @@ def session_dirs(username: str | None = None) -> list[Path]:
     return sorted(result, key=lambda item: item.name, reverse=True)
 
 
+def session_has_analytics(path: Path) -> bool:
+    """Return quickly once a timestamped non-system event is found."""
+    events_path = path / "events.ndjson"
+    try:
+        with events_path.open("r", encoding="utf-8", errors="replace") as rows:
+            for line in rows:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") not in {None, "system"} and isinstance(event.get("timestamp_ms"), (int, float)):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def session_label(path: Path) -> str:
+    meta = read_json(path / "session.json", {})
+    status = str(meta.get("status") or "unknown")
+    kind = "analytics" if session_has_analytics(path) else "system only"
+    return f"{path.name}  |  {status}  |  {kind}"
+
+
 def resolve_session(manual_id: str, username: str, selected_id: str) -> Path | None:
     manual_id = manual_id.strip()
     if manual_id:
@@ -186,6 +214,8 @@ def load_session(session_dir: Path | None):
         "chat": 0,
         "joins": 0,
         "follows": 0,
+        "shares": 0,
+        "subscribes": 0,
         "gifts": 0,
         "recent_chat": [],
         "recent_activity": [],
@@ -249,8 +279,14 @@ def load_session(session_dir: Path | None):
                 })
             elif event_type == "member":
                 summary["joins"] += 1
-            elif event_type == "social" and event.get("social_action") == "follow":
-                summary["follows"] += 1
+            elif event_type == "social":
+                action = event.get("social_action")
+                if action == "follow":
+                    summary["follows"] += 1
+                elif action == "share":
+                    summary["shares"] += 1
+            elif event_type == "subscribe":
+                summary["subscribes"] += 1
 
             if event_time and event_type not in {"system", "room"}:
                 summary["activity_rows"].append({
@@ -354,13 +390,14 @@ def render_activity_chart(rows: list[dict]):
     frame = (
         frame.assign(count=1)
         .set_index("time")
-        .resample("1min")["count"]
+        .groupby("event_type")["count"]
+        .resample("1min")
         .sum()
         .reset_index()
     )
     chart = (
         alt.Chart(frame)
-        .mark_bar()
+        .mark_line(point=False)
         .encode(
             x=alt.X(
                 "time:T",
@@ -368,8 +405,10 @@ def render_activity_chart(rows: list[dict]):
                 axis=alt.Axis(format="%m-%d %H:%M"),
             ),
             y=alt.Y("count:Q", title="Events per minute"),
+            color=alt.Color("event_type:N", title="Event type"),
             tooltip=[
                 alt.Tooltip("time:T", title="Taiwan time", format="%Y-%m-%d %H:%M"),
+                alt.Tooltip("event_type:N", title="Event type"),
                 alt.Tooltip("count:Q", title="Events"),
             ],
         )
@@ -756,18 +795,16 @@ def render_dashboard():
             key="analysis_manual_id",
         )
         available = session_dirs(username) if username else []
-        sessions_with_events = [
-            path for path in available
-            if (path / "events.ndjson").exists()
-            and (path / "events.ndjson").stat().st_size > 0
-        ]
-        if sessions_with_events:
-            available = sessions_with_events
+        analytics_sessions = [path for path in available if session_has_analytics(path)]
+        if analytics_sessions:
+            available = analytics_sessions
         available_ids = [path.name for path in available]
+        labels = {path.name: session_label(path) for path in available}
         selected_id = st.selectbox(
             "Available sessions",
             options=available_ids or [""],
             index=0,
+            format_func=lambda value: labels.get(value, value or "No session"),
             key="analysis_selected_id",
             disabled=bool(manual_id.strip()),
         )
@@ -815,15 +852,28 @@ def render_dashboard():
         st.info("No captured session is available for this streamer.")
         return
 
-    cols = st.columns(8)
-    cols[0].metric("Watch status", streamer_state.get("status", "unknown"))
-    cols[1].metric("Current viewer", display_metrics["viewers"][-1] if display_metrics["viewers"] else "N/A")
-    cols[2].metric("Peak viewer", max(display_metrics["viewers"]) if display_metrics["viewers"] else "N/A")
-    cols[3].metric("Chat", display_metrics["chat"])
-    cols[4].metric("Current likes", display_metrics["like_current_total"] if display_metrics["like_current_total"] is not None else display_metrics["likes"])
-    cols[5].metric("Observed likes", display_metrics["likes_observed"])
-    cols[6].metric("Current diamonds", display_metrics["diamonds"])
-    cols[7].metric("Members", display_metrics["joins"])
+    if tracking_dir:
+        st.success(f"LIVE collection active - {tracking_dir.name}")
+    elif metrics["viewer_rows"]:
+        st.info("Historical session analysis - no active LIVE collector for this streamer.")
+    else:
+        st.warning("This session contains system logs only. Select a session labeled analytics to display trends.")
+
+    st.markdown("#### Audience")
+    audience_cols = st.columns(4)
+    audience_cols[0].metric("Tracking status", streamer_state.get("status", "unknown"))
+    audience_cols[1].metric("Current viewers", display_metrics["viewers"][-1] if display_metrics["viewers"] else "N/A")
+    audience_cols[2].metric("Peak viewers", max(display_metrics["viewers"]) if display_metrics["viewers"] else "N/A")
+    audience_cols[3].metric("Join events", display_metrics["joins"])
+
+    st.markdown("#### Engagement & captured value")
+    engagement_cols = st.columns(6)
+    engagement_cols[0].metric("Chat messages", display_metrics["chat"])
+    engagement_cols[1].metric("Current likes", display_metrics["like_current_total"] if display_metrics["like_current_total"] is not None else display_metrics["likes"])
+    engagement_cols[2].metric("Observed likes", display_metrics["likes_observed"])
+    engagement_cols[3].metric("Follows / Shares", f"{display_metrics['follows']} / {display_metrics['shares']}")
+    engagement_cols[4].metric("Subscribes", display_metrics["subscribes"])
+    engagement_cols[5].metric("Captured diamonds", int(display_metrics["diamonds"]))
     if display_metrics["like_current_total"] is not None:
         st.caption(
             "Like total uses TikTok totalLikes; observed likes is the batch increment "
@@ -840,11 +890,23 @@ def render_dashboard():
         render_live_tracking(tracking_dir, tracking_metrics, streamer_state)
 
     with tab_overview:
+        if not metrics["viewer_rows"] and not metrics["activity_rows"]:
+            st.warning("No timestamped analytics events are available in this session.")
+        else:
+            trend_cols = st.columns(3)
+            trend_cols[0].metric("Viewer samples", len(metrics["viewer_rows"]))
+            trend_cols[1].metric("Captured events", sum(metrics["counts"].values()))
+            trend_cols[2].metric("Event categories", len([value for value in metrics["counts"].values() if value]))
         st.subheader("Viewer trend")
         render_viewer_chart(metrics["viewer_rows"])
-        st.subheader("Activity trend")
+        st.subheader("Activity trend by event type")
         render_activity_chart(metrics["activity_rows"])
-        st.write({"event_counts": dict(metrics["counts"])})
+        counts_frame = pd.DataFrame(
+            [{"event_type": key, "events": value} for key, value in metrics["counts"].most_common()]
+        )
+        if not counts_frame.empty:
+            st.subheader("Captured event breakdown")
+            st.dataframe(counts_frame, use_container_width=True, hide_index=True)
 
     with tab_chat:
         if metrics["recent_chat"]:
