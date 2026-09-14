@@ -77,7 +77,8 @@ def main():
 
     rows = load_rows(csv_path)
     if not rows:
-        raise RuntimeError("No rows found in timeseries CSV.")
+        print("[skip] No timestamped rows; plots not generated.")
+        return
 
     times = []
     viewer = []

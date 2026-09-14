@@ -65,12 +65,61 @@ def main():
                 continue
             events.append(json.loads(line))
 
-    if not events:
-        raise RuntimeError("No events found.")
+    source_event_count = len(events)
 
-    # Use server/event timestamp rather than file arrival order.
+    # Use server/event timestamp rather than file arrival order. System-only
+    # sessions may contain rows but no timestamped analytics events.
     events = [e for e in events if e.get("timestamp_ms") is not None]
     events.sort(key=lambda e: e["timestamp_ms"])
+
+    fieldnames = [
+        "window_start_local",
+        "window_start_utc",
+        "viewer_last",
+        "viewer_avg",
+        "viewer_min",
+        "viewer_max",
+        "viewer_delta",
+        "chat_count",
+        "unique_chatters",
+        "like_count",
+        "like_events",
+        "gift_events",
+        "unique_gifters",
+        "diamonds",
+    ]
+
+    if not events:
+        output_csv = session_dir / f"timeseries_{args.window}s.csv"
+        with output_csv.open("w", newline="", encoding="utf-8-sig") as f:
+            csv.DictWriter(f, fieldnames=fieldnames).writeheader()
+        summary = {
+            "window_seconds": args.window,
+            "timezone": "Asia/Taipei",
+            "first_event_local": None,
+            "last_event_local": None,
+            "first_event_utc": None,
+            "last_event_utc": None,
+            "observed_duration_seconds": 0,
+            "event_count": 0,
+            "source_event_count": source_event_count,
+            "chat": {"messages": 0, "unique_chatters": 0},
+            "likes": {"like_events": 0, "likes_received": 0},
+            "gifts": {"counted_gift_events": 0, "unique_gifters": 0, "total_diamonds": 0},
+            "viewers": {
+                "samples": 0,
+                "peak_observed": None,
+                "average_observed": None,
+                "median_observed": None,
+                "min_observed": None,
+            },
+        }
+        summary_path = session_dir / "summary.json"
+        summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"[done] 0 timestamped events processed (source rows: {source_event_count})")
+        print(f"[csv]  {output_csv}")
+        print(f"[json] {summary_path}")
+        return
 
     window_ms = args.window * 1000
     first_ts = events[0]["timestamp_ms"]
@@ -140,23 +189,6 @@ def main():
                 b["viewer_values"].append(v)
 
     output_csv = session_dir / f"timeseries_{args.window}s.csv"
-
-    fieldnames = [
-        "window_start_local",
-        "window_start_utc",
-        "viewer_last",
-        "viewer_avg",
-        "viewer_min",
-        "viewer_max",
-        "viewer_delta",
-        "chat_count",
-        "unique_chatters",
-        "like_count",
-        "like_events",
-        "gift_events",
-        "unique_gifters",
-        "diamonds",
-    ]
 
     rows = []
     previous_viewer = None

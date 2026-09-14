@@ -446,16 +446,38 @@ class Watcher:
 
         target = raw_root / f"{date}_{username}"
         events_path = target / "events.ndjson"
+        has_timestamped_event = False
         if events_path.exists() and events_path.stat().st_size > 0:
-            for script in ("analyzer.py", "plot_session.py"):
-                analyzer = (self.base_dir / "src" / script).resolve()
-                analyzed = subprocess.run(
-                    [sys.executable, str(analyzer), str(target), "--window", "60"],
+            with events_path.open("r", encoding="utf-8", errors="replace") as fp:
+                for line in fp:
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(row.get("timestamp_ms"), (int, float)):
+                        has_timestamped_event = True
+                        break
+
+        if events_path.exists() and events_path.stat().st_size > 0:
+            analyzer = (self.base_dir / "src" / "analyzer.py").resolve()
+            analyzed = subprocess.run(
+                [sys.executable, str(analyzer), str(target), "--window", "60"],
+                cwd=str(self.base_dir), capture_output=True, text=True, check=False
+            )
+            if analyzed.returncode != 0:
+                self.log(f"[AGGREGATE] @{username} analyzer.py failed: {analyzed.stderr.strip()}")
+                return
+            if has_timestamped_event:
+                plotter = (self.base_dir / "src" / "plot_session.py").resolve()
+                plotted = subprocess.run(
+                    [sys.executable, str(plotter), str(target), "--window", "60"],
                     cwd=str(self.base_dir), capture_output=True, text=True, check=False
                 )
-                if analyzed.returncode != 0:
-                    self.log(f"[AGGREGATE] @{username} {script} failed: {analyzed.stderr.strip()}")
+                if plotted.returncode != 0:
+                    self.log(f"[AGGREGATE] @{username} plot_session.py failed: {plotted.stderr.strip()}")
                     return
+            else:
+                self.log(f"[AGGREGATE] @{username} no timestamped events; summary written, plots skipped")
         try:
             write_health_report(target)
         except OSError as exc:
