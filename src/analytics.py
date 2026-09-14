@@ -344,6 +344,79 @@ def social_summary(session_dirs: list[Path]):
     return pd.DataFrame(rows)
 
 
+def social_activity_by_minute(session_dirs: list[Path]):
+    """Return Taiwan-time social and audience activity grouped by minute."""
+    rows = []
+    for session_dir in session_dirs:
+        for event in iter_events(session_dir) or []:
+            timestamp = event_time_ms(event)
+            if timestamp is None:
+                continue
+            event_type = event.get("type")
+            row = {
+                "session_id": session_dir.name, "timestamp_ms": timestamp,
+                "follows": 0, "shares": 0, "subscribes": 0,
+                "joins": 0, "viewer_count": None,
+            }
+            if event_type == "social":
+                action = str(event.get("social_action") or "unknown")
+                if action == "follow":
+                    row["follows"] = 1
+                elif action == "share":
+                    row["shares"] = 1
+                else:
+                    continue
+            elif event_type == "subscribe":
+                row["subscribes"] = 1
+            elif event_type == "member":
+                row["joins"] = 1
+            elif event_type == "viewer" and isinstance(event.get("viewer_count"), (int, float)):
+                row["viewer_count"] = float(event["viewer_count"])
+            else:
+                continue
+            rows.append(row)
+    columns = ["session_id", "time", "follows", "shares", "subscribes", "joins", "viewer_count"]
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    frame = pd.DataFrame(rows)
+    frame["time"] = pd.to_datetime(frame["timestamp_ms"], unit="ms", utc=True).dt.tz_convert(TAIPEI_TZ).dt.floor("min")
+    grouped = frame.groupby(["session_id", "time"], as_index=False).agg(
+        follows=("follows", "sum"), shares=("shares", "sum"),
+        subscribes=("subscribes", "sum"), joins=("joins", "sum"),
+        viewer_count=("viewer_count", "mean"),
+    )
+    return grouped[columns].sort_values(["time", "session_id"]).reset_index(drop=True)
+
+
+def social_conversion_proxies(session_dirs: list[Path]):
+    """Summarize observed actions; these rates are not causal conversions."""
+    rows = []
+    for session_dir in session_dirs:
+        events = list(iter_events(session_dir) or [])
+        timestamps = [value for event in events if (value := event_time_ms(event)) is not None]
+        duration_minutes = max((max(timestamps) - min(timestamps)) / 60000, 1 / 60) if timestamps else None
+        joins = sum(event.get("type") == "member" for event in events)
+        actions = {"follow": [], "share": [], "subscribe": []}
+        for event in events:
+            if event.get("type") == "social":
+                action = str(event.get("social_action") or "unknown")
+            elif event.get("type") == "subscribe":
+                action = "subscribe"
+            else:
+                continue
+            if action in actions:
+                actions[action].append(event)
+        row = {"session_id": session_dir.name, "observed_minutes": round(duration_minutes, 2) if duration_minutes else None, "joins": joins}
+        for action, action_events in actions.items():
+            count = len(action_events)
+            row[f"{action}s"] = count
+            row[f"unique_{action}_users"] = len({user_id(event) for event in action_events})
+            row[f"{action}_rate_per_min"] = round(count / duration_minutes, 3) if duration_minutes else None
+            row[f"{action}_per_100_joins_proxy"] = round(count * 100 / joins, 2) if joins else None
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def build_health_report(session_dir: Path):
     meta = read_json(session_dir / "session.json", {}) or {}
     event_count = 0

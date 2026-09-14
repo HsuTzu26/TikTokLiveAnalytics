@@ -20,6 +20,8 @@ from src.analytics import (
     gift_concentration,
     gift_detail,
     gift_leaderboard,
+    social_activity_by_minute,
+    social_conversion_proxies,
     social_summary,
     traffic_sources,
 )
@@ -534,6 +536,35 @@ def render_traffic_social_tab(session_paths: list[Path]):
             y=alt.Y("events:Q", title="Events"),
             tooltip=["action", "events", "unique_users"],
         ).properties(height=280)
+        st.altair_chart(chart, use_container_width=True)
+
+
+    proxies = social_conversion_proxies(session_paths)
+    if not proxies.empty:
+        st.subheader("Social rates (observed proxies)")
+        st.caption("Per-100-join values compare captured events only; they are not causal or unique-viewer conversion rates.")
+        st.dataframe(proxies, use_container_width=True, hide_index=True)
+
+    activity = social_activity_by_minute(session_paths)
+    if not activity.empty:
+        st.subheader("Social activity over time")
+        melted = activity.melt(
+            id_vars=["session_id", "time"],
+            value_vars=["follows", "shares", "subscribes"],
+            var_name="action", value_name="events",
+        )
+        chart = alt.Chart(melted).mark_line(point=True).encode(
+            x=alt.X("time:T", title="Taiwan time (Asia/Taipei)", axis=alt.Axis(format="%m-%d %H:%M")),
+            y=alt.Y("events:Q", title="Events per minute"),
+            color=alt.Color("action:N", title="Action"),
+            strokeDash=alt.StrokeDash("session_id:N", title="Session"),
+            tooltip=[
+                alt.Tooltip("time:T", title="Taiwan time", format="%Y-%m-%d %H:%M"),
+                alt.Tooltip("session_id:N", title="Session"),
+                alt.Tooltip("action:N", title="Action"),
+                alt.Tooltip("events:Q", title="Events"),
+            ],
+        ).properties(height=320).interactive()
         st.altair_chart(chart, use_container_width=True)
 
 
