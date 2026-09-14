@@ -5,7 +5,10 @@ import json
 import re
 from pathlib import Path
 
-from analytics import write_health_report
+try:
+    from .analytics import write_health_report
+except ImportError:
+    from analytics import write_health_report
 
 
 SESSION_RE = re.compile(r"^\d{8}_\d{6}_.+$")

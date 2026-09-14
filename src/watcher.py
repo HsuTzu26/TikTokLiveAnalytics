@@ -11,7 +11,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from tiktok_live_events import TikTokLive
-from health_monitor import write_health_report
+try:
+    from .health_monitor import write_health_report
+except ImportError:
+    from health_monitor import write_health_report
 
 
 WATCHER_VERSION = "0.2"
