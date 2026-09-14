@@ -125,7 +125,12 @@ def resolve_session(manual_id: str, username: str, selected_id: str) -> Path | N
         matches = []
         for path in session_dirs(username):
             meta = read_json(path / "session.json", {})
-            if str(meta.get("room_id") or "") == manual_id:
+            source_ids = [str(value) for value in meta.get("source_session_ids") or []]
+            if (
+                str(meta.get("room_id") or "") == manual_id
+                or str(meta.get("session_id") or "") == manual_id
+                or manual_id in source_ids
+            ):
                 matches.append(path)
         return matches[0] if matches else None
 
@@ -387,6 +392,13 @@ def render_dashboard():
             key="analysis_manual_id",
         )
         available = session_dirs(username) if username else []
+        sessions_with_events = [
+            path for path in available
+            if (path / "events.ndjson").exists()
+            and (path / "events.ndjson").stat().st_size > 0
+        ]
+        if sessions_with_events:
+            available = sessions_with_events
         available_ids = [path.name for path in available]
         selected_id = st.selectbox(
             "Available sessions",

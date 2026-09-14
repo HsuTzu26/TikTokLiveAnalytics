@@ -71,6 +71,8 @@ Probe timeout 或 HTTP 429 只會記錄並保留健康 Collector，不會觸發�
 
 The Streamlit dashboard displays all event times in Asia/Taipei. Select a streamer, then either choose an available session or enter its exact Session ID (for example 20260913_195928_chloe_o723_). Trend charts use timestamped X axes with explicit Taiwan-time and metric labels.
 
+The merge_daily_sessions.py utility can consolidate sessions into one daily folder per streamer and archives source folders under data/raw/archive/ while preserving source_session_id on every record.
+
 The sidebar also accepts a new streamer username and updates watchlist.json; the running watcher reloads it on the next polling cycle.
 
 The analyzer writes both window_start_local and window_start_utc; plotting prefers the Taiwan-time column. The collector finalizes a session after three consecutive authoritative is not currently live responses, while HTTP 429 and probe timeouts remain retryable.
