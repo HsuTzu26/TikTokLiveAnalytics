@@ -241,11 +241,29 @@ def local_timestamp(value):
         return value
 
 
+def parse_taipei_times(values) -> pd.Series:
+    """Parse mixed ISO-8601 timestamps and normalize them to Taiwan time.
+
+    Historical sessions contain both second precision
+    (``...20:05:40+08:00``) and microsecond precision
+    (``...20:05:40.123456+08:00``). ``format="mixed"`` prevents pandas
+    from inferring one format from the first row and rejecting the other.
+    Invalid timestamps become ``NaT`` and are filtered by the caller.
+    """
+    parsed = pd.to_datetime(
+        values,
+        format="mixed",
+        utc=True,
+        errors="coerce",
+    )
+    return parsed.dt.tz_convert(TAIPEI_TZ)
+
+
 def to_taipei_frame(rows: list[dict], value_column: str) -> pd.DataFrame:
     frame = pd.DataFrame(rows)
     if frame.empty:
         return frame
-    frame["time"] = pd.to_datetime(frame["time"], utc=True).dt.tz_convert(TAIPEI_TZ)
+    frame["time"] = parse_taipei_times(frame["time"])
     frame[value_column] = pd.to_numeric(frame[value_column], errors="coerce")
     return frame.dropna(subset=["time", value_column]).sort_values("time")
 
@@ -281,7 +299,8 @@ def render_activity_chart(rows: list[dict]):
     frame = pd.DataFrame(rows)
     if frame.empty:
         return
-    frame["time"] = pd.to_datetime(frame["time"], utc=True).dt.tz_convert(TAIPEI_TZ)
+    frame["time"] = parse_taipei_times(frame["time"])
+    frame = frame.dropna(subset=["time"])
     frame = (
         frame.assign(count=1)
         .set_index("time")
