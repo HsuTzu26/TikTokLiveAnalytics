@@ -222,6 +222,92 @@ def gift_detail(session_dirs: list[Path]):
     return pd.DataFrame(rows)
 
 
+def gift_concentration(session_dirs: list[Path]):
+    board = gift_leaderboard(session_dirs)
+    if board.empty:
+        return {
+            "gifter_count": 0,
+            "gift_events": 0,
+            "total_diamonds": 0.0,
+            "top1_share": None,
+            "top5_share": None,
+            "top10_share": None,
+            "peak_minute": None,
+            "peak_minute_diamonds": 0.0,
+        }
+    total = float(board["diamonds"].sum())
+    details = gift_detail(session_dirs)
+    peak_minute = None
+    peak_diamonds = 0.0
+    if not details.empty and details["time"].notna().any():
+        times = pd.to_datetime(details["time"], format="mixed", utc=True, errors="coerce")
+        details = details.assign(_time=times).dropna(subset=["_time"])
+        if not details.empty:
+            minute = details.set_index("_time").resample("1min")["diamonds"].sum()
+            if not minute.empty:
+                peak_timestamp = minute.idxmax()
+                peak_minute = peak_timestamp.tz_convert(TAIPEI_TZ).isoformat()
+                peak_diamonds = float(minute.max())
+    return {
+        "gifter_count": int(len(board)),
+        "gift_events": int(board["gift_events"].sum()),
+        "total_diamonds": total,
+        "top1_share": round(float(board.head(1)["diamonds"].sum()) / total, 4) if total else None,
+        "top5_share": round(float(board.head(5)["diamonds"].sum()) / total, 4) if total else None,
+        "top10_share": round(float(board.head(10)["diamonds"].sum()) / total, 4) if total else None,
+        "peak_minute": peak_minute,
+        "peak_minute_diamonds": peak_diamonds,
+    }
+
+
+def gift_activity_by_minute(session_dirs: list[Path]):
+    rows = []
+    for session_dir in session_dirs:
+        for event in iter_events(session_dir) or []:
+            timestamp = event_time_ms(event)
+            if timestamp is None:
+                continue
+            event_type = event.get("type")
+            if event_type == "gift" and event.get("counted"):
+                rows.append({
+                    "session_id": session_dir.name,
+                    "timestamp_ms": timestamp,
+                    "diamonds": float(event.get("diamond_total") or 0),
+                    "gift_events": 1,
+                    "chat_messages": 0,
+                    "viewer_count": None,
+                })
+            elif event_type == "chat":
+                rows.append({
+                    "session_id": session_dir.name,
+                    "timestamp_ms": timestamp,
+                    "diamonds": 0.0,
+                    "gift_events": 0,
+                    "chat_messages": 1,
+                    "viewer_count": None,
+                })
+            elif event_type == "viewer" and isinstance(event.get("viewer_count"), (int, float)):
+                rows.append({
+                    "session_id": session_dir.name,
+                    "timestamp_ms": timestamp,
+                    "diamonds": 0.0,
+                    "gift_events": 0,
+                    "chat_messages": 0,
+                    "viewer_count": float(event["viewer_count"]),
+                })
+    if not rows:
+        return pd.DataFrame(columns=["session_id", "time", "diamonds", "gift_events", "chat_messages", "viewer_count"])
+    frame = pd.DataFrame(rows)
+    frame["time"] = pd.to_datetime(frame["timestamp_ms"], unit="ms", utc=True).dt.tz_convert(TAIPEI_TZ).dt.floor("min")
+    grouped = frame.groupby(["session_id", "time"], as_index=False).agg(
+        diamonds=("diamonds", "sum"),
+        gift_events=("gift_events", "sum"),
+        chat_messages=("chat_messages", "sum"),
+        viewer_count=("viewer_count", "mean"),
+    )
+    return grouped.sort_values(["time", "session_id"]).reset_index(drop=True)
+
+
 def traffic_sources(session_dirs: list[Path]):
     rows = []
     for session_dir in session_dirs:

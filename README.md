@@ -83,6 +83,7 @@ The analyzer writes both window_start_local and window_start_utc; plotting prefe
 
 The dashboard now includes multi-session comparison, gift leaderboards with single/repeat/mixed sending patterns, entry-source traffic analysis, and follow/share/subscribe summaries. Select multiple sessions from the sidebar to compare viewer, engagement, and monetization metrics.
 Audience flow analysis now includes join rate per minute, viewer growth, viewer volatility, and early/mid/late live-phase comparisons. These are derived metrics from periodic viewer samples and member entry events.
+Gift analysis now includes Top 1/5/10 diamond concentration, peak gift minute, and same-minute gift/chat/viewer relation.
 The `Live tracking` tab refreshes the newest running session and shows current viewers, TikTok cumulative `totalLikes`, observed Like batches, captured diamonds, chat, gifts, and the latest event stream. Gift diamonds are derived from confirmed gift events (`diamondCount * repeatCount`); TikTok does not expose a room-wide cumulative diamond field in the current LIVE event payload.
 
 `src/health_monitor.py` writes `health.json` with connection, reconnect, disconnect, event completeness, unknown-event, SDK error, and socket quality metrics. The watcher refreshes health reports every 60 seconds for active collectors and writes a final report after daily aggregation.

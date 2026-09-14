@@ -16,6 +16,8 @@ from src.analytics import (
     audience_metrics,
     build_health_report,
     compare_sessions,
+    gift_activity_by_minute,
+    gift_concentration,
     gift_detail,
     gift_leaderboard,
     social_summary,
@@ -425,6 +427,19 @@ def render_gift_tab(session_paths: list[Path]):
     if board.empty:
         st.info("No counted gift events in the selected sessions.")
         return
+    concentration = gift_concentration(session_paths)
+    cols = st.columns(6)
+    cols[0].metric("Captured diamonds", int(concentration["total_diamonds"]))
+    cols[1].metric("Unique gifters", concentration["gifter_count"])
+    cols[2].metric("Gift events", concentration["gift_events"])
+    cols[3].metric("Top 1 share", f"{(concentration['top1_share'] or 0) * 100:.1f}%")
+    cols[4].metric("Top 5 share", f"{(concentration['top5_share'] or 0) * 100:.1f}%")
+    cols[5].metric("Top 10 share", f"{(concentration['top10_share'] or 0) * 100:.1f}%")
+    if concentration["peak_minute"]:
+        st.caption(
+            f"Gift peak: {concentration['peak_minute']} | "
+            f"{int(concentration['peak_minute_diamonds'])} diamonds in one minute"
+        )
     st.dataframe(board, use_container_width=True, hide_index=True)
     chart = alt.Chart(board.head(15)).mark_bar().encode(
         x=alt.X("diamonds:Q", title="Diamonds"),
@@ -436,6 +451,26 @@ def render_gift_tab(session_paths: list[Path]):
         ],
     ).properties(height=max(260, min(560, 24 * len(board.head(15)))))
     st.altair_chart(chart, use_container_width=True)
+    activity = gift_activity_by_minute(session_paths)
+    if not activity.empty:
+        st.subheader("Gift activity by minute")
+        chart = alt.Chart(activity).mark_bar().encode(
+            x=alt.X("time:T", title="Taiwan time (Asia/Taipei)", axis=alt.Axis(format="%m-%d %H:%M")),
+            y=alt.Y("diamonds:Q", title="Captured diamonds"),
+            tooltip=[
+                alt.Tooltip("time:T", title="Taiwan time", format="%Y-%m-%d %H:%M"),
+                alt.Tooltip("diamonds:Q", title="Diamonds"),
+                alt.Tooltip("gift_events:Q", title="Gift events"),
+                alt.Tooltip("chat_messages:Q", title="Chat messages"),
+                alt.Tooltip("viewer_count:Q", title="Average viewers"),
+            ],
+        ).properties(height=300).interactive()
+        st.altair_chart(chart, use_container_width=True)
+        relation = activity[(activity["diamonds"] > 0) | (activity["chat_messages"] > 0)].copy()
+        if not relation.empty:
+            st.subheader("Gift / chat / viewer relation")
+            st.dataframe(relation.sort_values("diamonds", ascending=False).head(100), use_container_width=True, hide_index=True)
+
     details = gift_detail(session_paths)
     if not details.empty:
         st.subheader("Gift transactions")
