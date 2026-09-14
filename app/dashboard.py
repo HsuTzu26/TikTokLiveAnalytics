@@ -183,6 +183,7 @@ def load_session(session_dir: Path | None):
         "follows": 0,
         "gifts": 0,
         "recent_chat": [],
+        "recent_activity": [],
     }
     if session_dir is None:
         return summary
@@ -251,8 +252,28 @@ def load_session(session_dir: Path | None):
                     "time": event_time,
                     "event_type": event_type,
                 })
+                actor = event.get("unique_id") or event.get("nickname") or ""
+                if event_type == "chat":
+                    detail = event.get("comment") or "[emote]"
+                elif event_type == "gift":
+                    detail = f"{event.get('gift_name') or 'gift'} x{event.get('repeat_count') or 1}"
+                elif event_type == "like":
+                    detail = f"+{event.get('like_count') or 0}"
+                elif event_type == "viewer":
+                    detail = f"viewers={event.get('viewer_count')}"
+                elif event_type == "social":
+                    detail = str(event.get("social_action") or "social")
+                else:
+                    detail = event_type
+                summary["recent_activity"].append({
+                    "time": event_time,
+                    "type": event_type,
+                    "user": actor,
+                    "detail": detail,
+                })
 
     summary["recent_chat"] = summary["recent_chat"][-30:][::-1]
+    summary["recent_activity"] = summary["recent_activity"][-50:][::-1]
     return summary
 
 
@@ -548,6 +569,39 @@ def remove_streamer_from_watchlist(raw_username: str) -> str:
     return f"@{username} removed from watchlist. Captured data was kept."
 
 
+
+def latest_live_session(username: str | None) -> Path | None:
+    if not username:
+        return None
+    candidates = []
+    for path in session_dirs(username):
+        meta = read_json(path / "session.json", {})
+        if meta.get("status") == "running":
+            candidates.append((str(meta.get("collector_started_at_utc") or path.name), path))
+    return max(candidates, key=lambda item: item[0])[1] if candidates else None
+
+
+def render_live_tracking(session_dir: Path | None, metrics: dict, streamer_state: dict):
+    if session_dir is None:
+        st.info("No active tracking session.")
+        return
+    session = metrics.get("session") or {}
+    st.caption(
+        f"Live session: {session_dir.name} | status={session.get('status', 'unknown')} | "
+        f"last event={session.get('last_received_at_local') or 'waiting'}"
+    )
+    cols = st.columns(6)
+    cols[0].metric("Watch status", streamer_state.get("status", "unknown"))
+    cols[1].metric("Current viewer", metrics["viewers"][-1] if metrics["viewers"] else "N/A")
+    cols[2].metric("Current likes", metrics["like_current_total"] if metrics["like_current_total"] is not None else metrics["likes"])
+    cols[3].metric("Current diamonds", metrics["diamonds"])
+    cols[4].metric("Chat", metrics["chat"])
+    cols[5].metric("Gift events", metrics["gifts"])
+    if metrics["recent_activity"]:
+        st.dataframe(metrics["recent_activity"], use_container_width=True, hide_index=True)
+    else:
+        st.info("Waiting for live events...")
+
 def render_dashboard():
     config = read_json(CONFIG_PATH, {"streamers": []})
     state = read_json(WATCHER_STATE, {"streamers": {}})
@@ -653,6 +707,9 @@ def render_dashboard():
     metrics = load_session(session_dir)
     session = metrics["session"] or {}
     streamer_state = states.get(username, {})
+    tracking_dir = latest_live_session(username)
+    tracking_metrics = load_session(tracking_dir) if tracking_dir else metrics
+    display_metrics = tracking_metrics if tracking_dir and not manual_id.strip() else metrics
     comparison_paths = [
         RAW_ROOT / session_id
         for session_id in comparison_ids
@@ -674,25 +731,28 @@ def render_dashboard():
 
     cols = st.columns(8)
     cols[0].metric("Watch status", streamer_state.get("status", "unknown"))
-    cols[1].metric("Current viewer", metrics["viewers"][-1] if metrics["viewers"] else "N/A")
-    cols[2].metric("Peak viewer", max(metrics["viewers"]) if metrics["viewers"] else "N/A")
-    cols[3].metric("Chat", metrics["chat"])
-    cols[4].metric("Current likes", metrics["like_current_total"] if metrics["like_current_total"] is not None else metrics["likes"])
-    cols[5].metric("Observed likes", metrics["likes_observed"])
-    cols[6].metric("Diamonds", metrics["diamonds"])
-    cols[7].metric("Members", metrics["joins"])
-    if metrics["like_current_total"] is not None:
+    cols[1].metric("Current viewer", display_metrics["viewers"][-1] if display_metrics["viewers"] else "N/A")
+    cols[2].metric("Peak viewer", max(display_metrics["viewers"]) if display_metrics["viewers"] else "N/A")
+    cols[3].metric("Chat", display_metrics["chat"])
+    cols[4].metric("Current likes", display_metrics["like_current_total"] if display_metrics["like_current_total"] is not None else display_metrics["likes"])
+    cols[5].metric("Observed likes", display_metrics["likes_observed"])
+    cols[6].metric("Current diamonds", display_metrics["diamonds"])
+    cols[7].metric("Members", display_metrics["joins"])
+    if display_metrics["like_current_total"] is not None:
         st.caption(
             "Like total uses TikTok totalLikes; observed likes is the batch increment "
-            f"captured by this collector. Estimated pre-capture likes: {metrics['like_baseline_estimate']}."
+            f"captured by this collector. Estimated pre-capture likes: {display_metrics['like_baseline_estimate']}."
         )
 
-    tab_overview, tab_chat, tab_compare, tab_gifts, tab_traffic, tab_health, tab_quality = st.tabs(
+    tab_tracking, tab_overview, tab_chat, tab_compare, tab_gifts, tab_traffic, tab_health, tab_quality = st.tabs(
         [
-            "Trends", "Recent chat", "Multi-session",
+            "Live tracking", "Trends", "Recent chat", "Multi-session",
             "Gifts", "Traffic & social", "System health", "Data quality",
         ]
     )
+    with tab_tracking:
+        render_live_tracking(tracking_dir, tracking_metrics, streamer_state)
+
     with tab_overview:
         st.subheader("Viewer trend")
         render_viewer_chart(metrics["viewer_rows"])
