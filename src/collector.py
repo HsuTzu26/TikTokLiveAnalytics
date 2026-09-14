@@ -338,6 +338,12 @@ def main():
         default=20,
         help="Automatic reconnect attempts (default: 20)",
     )
+    parser.add_argument(
+        "--offline-confirmations",
+        type=int,
+        default=3,
+        help="End the session after this many consecutive authoritative offline responses (default: 3)",
+    )
     args = parser.parse_args()
 
     username = args.username.lstrip("@")
@@ -390,6 +396,8 @@ def main():
         "duplicate_event_counts": Counter(),
         "rate_limited": False,
         "error_event_count": 0,
+        "offline_misses": 0,
+        "offline_confirmed": False,
         "live_end_detected": False,
         "raw_event_count": 0,
     }
@@ -444,7 +452,11 @@ def main():
         "raw_event_count": 0,
         "collector_log_file": collector_log_path.name,
         "live_end_detected": False,
+        "offline_confirmed": False,
+        "offline_miss_count": 0,
+        "offline_confirmation_threshold": args.offline_confirmations,
         "last_received_at_utc": None,
+        "last_received_at_local": None,
         "environment": {
             "python": platform.python_version(),
             "platform": platform.platform(),
@@ -463,6 +475,15 @@ def main():
         session_meta["room_id"] = state["room_id"]
         session_meta["event_counts"] = dict(state["event_counts"])
         session_meta["last_received_at_utc"] = state["last_received_at_utc"]
+        if state["last_received_at_utc"]:
+            session_meta["last_received_at_local"] = iso_local_from_ms(
+                int(datetime.fromisoformat(
+                    state["last_received_at_utc"]
+                ).timestamp() * 1000),
+                local_tz,
+            )
+        session_meta["offline_confirmed"] = state["offline_confirmed"]
+        session_meta["offline_miss_count"] = state["offline_misses"]
         session_meta["duplicate_event_counts"] = dict(
             state["duplicate_event_counts"]
         )
@@ -653,6 +674,9 @@ def main():
 
     @live.on("connected")
     def on_connected(e):
+        state["offline_misses"] = 0
+        state["offline_confirmed"] = False
+        session_meta["offline_confirmed"] = False
         received = now_ms()
 
         state["connection_id"] += 1
@@ -1000,6 +1024,14 @@ def main():
     def on_error(e):
         e = e or {}
         state["error_event_count"] += 1
+        error_text = str(e.get("error") or e)
+        if "is not currently live" in error_text.lower():
+            state["offline_misses"] += 1
+        else:
+            # 429, timeout, and transport errors break an authoritative
+            # offline sequence and must not close a captured session.
+            state["offline_misses"] = 0
+        session_meta["offline_miss_count"] = state["offline_misses"]
         received = now_ms()
 
         row = {
@@ -1097,6 +1129,15 @@ def main():
             if state["rate_limited"]:
                 return
 
+            if state["offline_misses"] >= args.offline_confirmations:
+                state["offline_confirmed"] = True
+                session_meta["offline_confirmed"] = True
+                print(
+                    f"[offline] {args.offline_confirmations} consecutive "
+                    "authoritative offline responses"
+                )
+                return
+
             connected_cycle_seconds = time.monotonic() - started
 
             # A reasonably healthy cycle resets backoff. Very short failures
@@ -1115,6 +1156,8 @@ def main():
         asyncio.run(run_resilient())
         if state["live_end_detected"]:
             exit_status = "live_end"
+        elif state["offline_confirmed"]:
+            exit_status = "offline_confirmed"
         elif state["rate_limited"]:
             exit_status = "rate_limited"
     except KeyboardInterrupt:

@@ -4,3 +4,5 @@
 # Plot generation dependency; the SDK installs websockets as a transitive dependency.
 matplotlib>=3.11,<4
 streamlit>=1.40,<2
+pandas>=2.0,<4
+altair>=5,<7

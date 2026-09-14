@@ -66,3 +66,9 @@ python -m streamlit run app\dashboard.py --server.address 127.0.0.1 --server.por
 
 每個 session 會產生 `collector.log`；Watcher 會寫入 `data/watcher/watcher.log`。
 Probe timeout 或 HTTP 429 只會記錄並保留健康 Collector，不會觸發停止。
+
+## Dashboard analysis
+
+The Streamlit dashboard displays all event times in Asia/Taipei. Select a streamer, then either choose an available session or enter its exact Session ID (for example 20260913_195928_chloe_o723_). Trend charts use timestamped X axes with explicit Taiwan-time and metric labels.
+
+The analyzer writes both window_start_local and window_start_utc; plotting prefers the Taiwan-time column. The collector finalizes a session after three consecutive authoritative is not currently live responses, while HTTP 429 and probe timeouts remain retryable.

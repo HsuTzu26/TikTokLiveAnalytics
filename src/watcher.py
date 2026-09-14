@@ -241,6 +241,8 @@ class Watcher:
             username,
             "--output-root",
             str(output_root),
+            "--offline-confirmations",
+            str(self.config.get("offline_confirmations", 3)),
         ]
 
     def start_collector(self, username, room_id=None):

@@ -1,9 +1,15 @@
 import argparse
 import csv
 from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import matplotlib.dates as mdates
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+
+
+TAIPEI_TZ = ZoneInfo("Asia/Taipei")
 
 
 def load_rows(csv_path):
@@ -28,28 +34,32 @@ def parse_int(value):
 
 
 def save_line(x, y, title, ylabel, out_path, marker=True):
-    plt.figure(figsize=(11, 5))
+    figure, axis = plt.subplots(figsize=(12, 5))
     if marker:
-        plt.plot(x, y, marker="o")
+        axis.plot(x, y, marker="o", markersize=3)
     else:
-        plt.plot(x, y)
-    plt.title(title)
-    plt.xlabel("Time")
-    plt.ylabel(ylabel)
-    plt.xticks(rotation=45, ha="right")
-    plt.grid(True, alpha=0.25)
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=150)
-    plt.close()
+        axis.plot(x, y)
+    axis.set_title(title)
+    axis.set_xlabel("Taiwan time (Asia/Taipei)")
+    axis.set_ylabel(ylabel)
+    axis.xaxis.set_major_locator(mdates.AutoDateLocator())
+    axis.xaxis.set_major_formatter(
+        mdates.DateFormatter("%m-%d %H:%M", tz=TAIPEI_TZ)
+    )
+    figure.autofmt_xdate(rotation=35, ha="right")
+    axis.grid(True, alpha=0.25)
+    figure.tight_layout()
+    figure.savefig(out_path, dpi=150)
+    plt.close(figure)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Plot TikTok LIVE session time series."
+        description="Plot TikTok LIVE session time series in Taiwan time."
     )
     parser.add_argument(
         "session_dir",
-        help="Session directory containing timeseries_30s.csv",
+        help="Session directory containing the analyzer timeseries CSV.",
     )
     parser.add_argument(
         "--window",
@@ -79,8 +89,12 @@ def main():
     running_diamonds = 0
 
     for r in rows:
-        dt = datetime.fromisoformat(r["window_start_utc"])
-        times.append(dt.strftime("%H:%M:%S"))
+        dt = datetime.fromisoformat(
+            r.get("window_start_local") or r["window_start_utc"]
+        )
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=TAIPEI_TZ)
+        times.append(dt.astimezone(TAIPEI_TZ))
 
         v = parse_float(r["viewer_last"])
         viewer.append(v)

@@ -3,13 +3,23 @@ import csv
 import json
 from collections import defaultdict
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
+
+
+TAIPEI_TZ = ZoneInfo("Asia/Taipei")
 
 
 def iso_utc(timestamp_ms):
     return datetime.fromtimestamp(
         timestamp_ms / 1000, tz=timezone.utc
     ).isoformat()
+
+
+def iso_local(timestamp_ms):
+    return datetime.fromtimestamp(
+        timestamp_ms / 1000, tz=timezone.utc
+    ).astimezone(TAIPEI_TZ).isoformat()
 
 
 def percentile(values, p):
@@ -132,6 +142,7 @@ def main():
     output_csv = session_dir / f"timeseries_{args.window}s.csv"
 
     fieldnames = [
+        "window_start_local",
         "window_start_utc",
         "viewer_last",
         "viewer_avg",
@@ -166,6 +177,7 @@ def main():
             previous_viewer = viewer_last
 
         rows.append({
+            "window_start_local": iso_local(bucket_start),
             "window_start_utc": iso_utc(bucket_start),
             "viewer_last": viewer_last,
             "viewer_avg": round(viewer_avg, 2) if viewer_avg is not None else None,
@@ -193,6 +205,9 @@ def main():
 
     summary = {
         "window_seconds": args.window,
+        "timezone": "Asia/Taipei",
+        "first_event_local": iso_local(events[0]["timestamp_ms"]),
+        "last_event_local": iso_local(events[-1]["timestamp_ms"]),
         "first_event_utc": iso_utc(events[0]["timestamp_ms"]),
         "last_event_utc": iso_utc(events[-1]["timestamp_ms"]),
         "observed_duration_seconds": round(duration_sec, 2),
