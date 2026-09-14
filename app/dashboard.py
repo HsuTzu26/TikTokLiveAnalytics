@@ -12,6 +12,15 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
+from src.analytics import (
+    build_health_report,
+    compare_sessions,
+    gift_detail,
+    gift_leaderboard,
+    social_summary,
+    traffic_sources,
+)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_ROOT = ROOT / "data"
@@ -329,6 +338,133 @@ def render_activity_chart(rows: list[dict]):
     st.altair_chart(chart, use_container_width=True)
 
 
+
+def render_compare_tab(session_paths: list[Path]):
+    frame = compare_sessions(session_paths)
+    if frame.empty:
+        st.info("No sessions selected for comparison.")
+        return
+    columns = [
+        "session_id", "status", "first_event_local", "last_event_local",
+        "observed_duration_seconds", "peak_viewers", "average_viewers",
+        "chat_messages", "unique_chatters", "likes_received",
+        "total_diamonds", "members", "follows", "shares", "subscribes",
+    ]
+    st.dataframe(
+        frame[[column for column in columns if column in frame]],
+        use_container_width=True,
+        hide_index=True,
+    )
+    metric_options = {
+        "Peak viewers": "peak_viewers",
+        "Average viewers": "average_viewers",
+        "Likes": "likes_received",
+        "Diamonds": "total_diamonds",
+        "Members": "members",
+        "Follows": "follows",
+        "Shares": "shares",
+        "Subscribes": "subscribes",
+    }
+    label = st.selectbox("Comparison metric", list(metric_options), key="comparison_metric")
+    column = metric_options[label]
+    chart = alt.Chart(frame).mark_bar().encode(
+        x=alt.X("session_id:N", sort="-y", title="Session"),
+        y=alt.Y(f"{column}:Q", title=label),
+        tooltip=[
+            alt.Tooltip("session_id:N", title="Session"),
+            alt.Tooltip(f"{column}:Q", title=label),
+        ],
+    ).properties(height=320)
+    st.altair_chart(chart, use_container_width=True)
+
+
+def render_gift_tab(session_paths: list[Path]):
+    board = gift_leaderboard(session_paths)
+    if board.empty:
+        st.info("No counted gift events in the selected sessions.")
+        return
+    st.dataframe(board, use_container_width=True, hide_index=True)
+    chart = alt.Chart(board.head(15)).mark_bar().encode(
+        x=alt.X("diamonds:Q", title="Diamonds"),
+        y=alt.Y("gifter:N", sort="-x", title="Gifter"),
+        color=alt.Color("send_pattern:N", title="Send pattern"),
+        tooltip=[
+            "gifter", "diamonds", "items", "gift_events",
+            "max_repeat_count", "send_pattern",
+        ],
+    ).properties(height=max(260, min(560, 24 * len(board.head(15)))))
+    st.altair_chart(chart, use_container_width=True)
+    details = gift_detail(session_paths)
+    if not details.empty:
+        st.subheader("Gift transactions")
+        st.dataframe(
+            details.sort_values("diamonds", ascending=False).head(100),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+def render_traffic_social_tab(session_paths: list[Path]):
+    traffic = traffic_sources(session_paths)
+    st.subheader("Entry source")
+    if traffic.empty:
+        st.info("No member entry-source events in the selected sessions.")
+    else:
+        source_counts = (
+            traffic.groupby("entry_source", dropna=False)
+            .size()
+            .reset_index(name="joins")
+            .sort_values("joins", ascending=False)
+        )
+        st.dataframe(source_counts, use_container_width=True, hide_index=True)
+        chart = alt.Chart(source_counts.head(20)).mark_bar().encode(
+            x=alt.X("joins:Q", title="Join events"),
+            y=alt.Y("entry_source:N", sort="-x", title="Entry source"),
+            tooltip=["entry_source", "joins"],
+        ).properties(height=max(260, min(560, 24 * len(source_counts.head(20)))))
+        st.altair_chart(chart, use_container_width=True)
+
+    st.subheader("Follow / Share / Subscribe")
+    social = social_summary(session_paths)
+    if social.empty:
+        st.info("No follow, share, or subscribe events in the selected sessions.")
+    else:
+        social_counts = (
+            social.groupby("action", dropna=False)
+            .agg(events=("action", "size"), unique_users=("user", "nunique"))
+            .reset_index()
+            .sort_values("events", ascending=False)
+        )
+        st.dataframe(social_counts, use_container_width=True, hide_index=True)
+        chart = alt.Chart(social_counts).mark_bar().encode(
+            x=alt.X("action:N", title="Action"),
+            y=alt.Y("events:Q", title="Events"),
+            tooltip=["action", "events", "unique_users"],
+        ).properties(height=280)
+        st.altair_chart(chart, use_container_width=True)
+
+
+def render_health_tab(session_paths: list[Path]):
+    reports = [build_health_report(path) for path in session_paths]
+    if not reports:
+        st.info("No sessions selected for health monitoring.")
+        return
+    frame = pd.DataFrame(reports)
+    columns = [
+        "session_id", "status", "connection_count", "reconnect_count",
+        "disconnect_count", "event_count", "raw_event_count",
+        "socket_uptime_ratio", "socket_gap_seconds",
+        "duplicate_events_dropped", "sdk_error_events",
+        "unknown_event_count", "offline_confirmed", "live_end_detected",
+    ]
+    st.dataframe(
+        frame[[column for column in columns if column in frame]],
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.json({"selected_sessions": reports})
+
+
 def add_streamer_to_watchlist(raw_username: str) -> str:
     username = raw_username.strip().lstrip("@").strip()
     if not username:
@@ -478,6 +614,13 @@ def render_dashboard():
             key="analysis_selected_id",
             disabled=bool(manual_id.strip()),
         )
+        comparison_ids = st.multiselect(
+            "Compare sessions",
+            options=available_ids,
+            default=([selected_id] if selected_id else []),
+            key="comparison_session_ids",
+            help="Select multiple sessions for trend, Gift, traffic, and social comparisons.",
+        )
         if manual_id.strip():
             st.caption("Manual Session ID overrides the dropdown.")
         st.caption(f"Raw data: {RAW_ROOT}")
@@ -493,6 +636,13 @@ def render_dashboard():
     metrics = load_session(session_dir)
     session = metrics["session"] or {}
     streamer_state = states.get(username, {})
+    comparison_paths = [
+        RAW_ROOT / session_id
+        for session_id in comparison_ids
+        if session_id and (RAW_ROOT / session_id).is_dir()
+    ]
+    if session_dir and session_dir not in comparison_paths:
+        comparison_paths.insert(0, session_dir)
 
     st.subheader(f"@{username}")
     if session_dir:
@@ -514,8 +664,11 @@ def render_dashboard():
     cols[5].metric("Diamonds", metrics["diamonds"])
     cols[6].metric("Members", metrics["joins"])
 
-    tab_overview, tab_chat, tab_quality = st.tabs(
-        ["Trends", "Recent chat", "Data quality"]
+    tab_overview, tab_chat, tab_compare, tab_gifts, tab_traffic, tab_health, tab_quality = st.tabs(
+        [
+            "Trends", "Recent chat", "Multi-session",
+            "Gifts", "Traffic & social", "System health", "Data quality",
+        ]
     )
     with tab_overview:
         st.subheader("Viewer trend")
@@ -533,6 +686,18 @@ def render_dashboard():
             )
         else:
             st.info("No chat messages in this session.")
+
+    with tab_compare:
+        render_compare_tab(comparison_paths)
+
+    with tab_gifts:
+        render_gift_tab(comparison_paths)
+
+    with tab_traffic:
+        render_traffic_social_tab(comparison_paths)
+
+    with tab_health:
+        render_health_tab(comparison_paths)
 
     with tab_quality:
         quality = session.get("data_quality", {})

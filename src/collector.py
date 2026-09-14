@@ -1082,6 +1082,7 @@ def main():
             "connection_id": state["connection_id"],
             "received_at_ms": received,
             "received_at_utc": iso_utc_from_ms(received),
+            "kind": "unknown_event",
             "event_type": e.get("type"),
             "timestamp_ms": e.get("timestamp"),
             "msg_id": e.get("msgId"),

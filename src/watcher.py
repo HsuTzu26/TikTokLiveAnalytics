@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from tiktok_live_events import TikTokLive
+from health_monitor import write_health_report
 
 
 WATCHER_VERSION = "0.2"
@@ -38,6 +39,7 @@ def load_config(path):
         "restart_delay_seconds": 10,
         "start_collector_on_probe_error": True,
         "collector_probe_error_cooldown_seconds": 300,
+        "health_check_seconds": 60,
         "streamers": [],
     }
 
@@ -159,6 +161,7 @@ class Watcher:
 
         self.processes = {}
         self.fallback_last_started = {}
+        self.last_health_check = 0.0
         self.running = True
 
     @staticmethod
@@ -450,7 +453,42 @@ class Watcher:
                 if analyzed.returncode != 0:
                     self.log(f"[AGGREGATE] @{username} {script} failed: {analyzed.stderr.strip()}")
                     return
+        try:
+            write_health_report(target)
+        except OSError as exc:
+            self.log(f"[HEALTH] @{username} report failed: {exc}")
         self.log(f"[AGGREGATE] @{username} daily={target.name} sources refreshed")
+
+    def refresh_health_reports(self):
+        for username, process in list(self.processes.items()):
+            if process.poll() is not None:
+                continue
+            source = self.latest_source(username)
+            if source is None:
+                continue
+            try:
+                write_health_report(source)
+            except OSError as exc:
+                self.log(f"[HEALTH] @{username} report failed: {exc}")
+
+    def latest_source(self, username):
+        root = self.output_root()
+        candidates = []
+        if not root.exists():
+            return None
+        for path in root.iterdir():
+            if not path.is_dir() or not re.match(r"^\d{8}_\d{6}_", path.name):
+                continue
+            meta_path = path / "session.json"
+            if not meta_path.exists():
+                continue
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            if str(meta.get("username") or "").lstrip("@") == username:
+                candidates.append((str(meta.get("collector_started_at_utc") or ""), path))
+        return max(candidates, key=lambda item: item[0])[1] if candidates else None
 
     def check_crashed_collectors(self):
         for username, process in list(self.processes.items()):
@@ -602,6 +640,10 @@ class Watcher:
                     if s["enabled"]
                 ]
                 self.check_crashed_collectors()
+
+                if time.monotonic() - self.last_health_check >= float(self.config.get("health_check_seconds", 60)):
+                    self.refresh_health_reports()
+                    self.last_health_check = time.monotonic()
 
                 # Do not probe a streamer while its collector is healthy.
                 # Probe failures (429/timeout) are not proof that a LIVE ended

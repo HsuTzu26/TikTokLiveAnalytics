@@ -79,3 +79,16 @@ Use “Remove from watchlist” to delete a streamer from future tracking; exist
 The dashboard starts the watcher without pre-creating its PID file; `src/watcher.py` owns that file so adding/enabling streamers does not trigger a false “already running” exit.
 
 The analyzer writes both window_start_local and window_start_utc; plotting prefers the Taiwan-time column. The collector finalizes a session after three consecutive authoritative is not currently live responses, while HTTP 429 and probe timeouts remain retryable.
+## Analytics and health monitoring
+
+The dashboard now includes multi-session comparison, gift leaderboards with single/repeat/mixed sending patterns, entry-source traffic analysis, and follow/share/subscribe summaries. Select multiple sessions from the sidebar to compare viewer, engagement, and monetization metrics.
+
+`src/health_monitor.py` writes `health.json` with connection, reconnect, disconnect, event completeness, unknown-event, SDK error, and socket quality metrics. The watcher refreshes health reports every 60 seconds for active collectors and writes a final report after daily aggregation.
+
+Examples:
+
+```powershell
+.\.venv\Scripts\python.exe src\health_monitor.py --raw-root data\raw --all
+.\.venv\Scripts\python.exe src\health_monitor.py --raw-root data\raw --session 20260914_103005_pubg.esports.official
+```
+
