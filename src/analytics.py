@@ -4,6 +4,7 @@ import json
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
+from statistics import pstdev
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -48,6 +49,59 @@ def iso_local(timestamp_ms):
 
 def user_id(event):
     return str(event.get("unique_id") or event.get("user_id") or event.get("nickname") or "unknown")
+
+
+def audience_metrics(session_dir: Path):
+    events = list(iter_events(session_dir) or [])
+    viewer_rows = [
+        (event_time_ms(event), float(event["viewer_count"]))
+        for event in events
+        if event.get("type") == "viewer"
+        and isinstance(event.get("viewer_count"), (int, float))
+        and event_time_ms(event) is not None
+    ]
+    member_times = [event_time_ms(event) for event in events if event.get("type") == "member" and event_time_ms(event) is not None]
+    timestamps = [event_time_ms(event) for event in events if event_time_ms(event) is not None]
+    if not timestamps:
+        return {
+            "session_id": session_dir.name,
+            "join_rate_per_min": None,
+            "viewer_growth": None,
+            "viewer_volatility": None,
+            "early_avg_viewers": None,
+            "mid_avg_viewers": None,
+            "late_avg_viewers": None,
+            "early_joins": 0,
+            "mid_joins": 0,
+            "late_joins": 0,
+        }
+    start, end = min(timestamps), max(timestamps)
+    duration_ms = max(1, end - start)
+    duration_min = duration_ms / 60000
+    values = [value for _, value in viewer_rows]
+    average = sum(values) / len(values) if values else None
+    phase_viewers = {"early": [], "mid": [], "late": []}
+    phase_joins = {"early": 0, "mid": 0, "late": 0}
+    for timestamp, value in viewer_rows:
+        ratio = (timestamp - start) / duration_ms
+        phase = "early" if ratio < 1 / 3 else ("mid" if ratio < 2 / 3 else "late")
+        phase_viewers[phase].append(value)
+    for timestamp in member_times:
+        ratio = (timestamp - start) / duration_ms
+        phase = "early" if ratio < 1 / 3 else ("mid" if ratio < 2 / 3 else "late")
+        phase_joins[phase] += 1
+    return {
+        "session_id": session_dir.name,
+        "join_rate_per_min": round(len(member_times) / duration_min, 3),
+        "viewer_growth": round(values[-1] - values[0], 3) if len(values) >= 2 else None,
+        "viewer_volatility": round(pstdev(values) / average, 4) if values and average else None,
+        "early_avg_viewers": round(sum(phase_viewers["early"]) / len(phase_viewers["early"]), 2) if phase_viewers["early"] else None,
+        "mid_avg_viewers": round(sum(phase_viewers["mid"]) / len(phase_viewers["mid"]), 2) if phase_viewers["mid"] else None,
+        "late_avg_viewers": round(sum(phase_viewers["late"]) / len(phase_viewers["late"]), 2) if phase_viewers["late"] else None,
+        "early_joins": phase_joins["early"],
+        "mid_joins": phase_joins["mid"],
+        "late_joins": phase_joins["late"],
+    }
 
 
 def session_summary(session_dir: Path):
@@ -101,6 +155,7 @@ def session_summary(session_dir: Path):
         "social_events": len(social),
         "subscribes": len(subscribes),
         "room_id": meta.get("room_id"),
+        **{key: value for key, value in audience_metrics(session_dir).items() if key != "session_id"},
     }
 
 

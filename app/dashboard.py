@@ -13,6 +13,7 @@ import pandas as pd
 import streamlit as st
 
 from src.analytics import (
+    audience_metrics,
     build_health_report,
     compare_sessions,
     gift_detail,
@@ -402,6 +403,9 @@ def render_compare_tab(session_paths: list[Path]):
         "Follows": "follows",
         "Shares": "shares",
         "Subscribes": "subscribes",
+        "Join rate / min": "join_rate_per_min",
+        "Viewer growth": "viewer_growth",
+        "Viewer volatility": "viewer_volatility",
     }
     label = st.selectbox("Comparison metric", list(metric_options), key="comparison_metric")
     column = metric_options[label]
@@ -443,6 +447,22 @@ def render_gift_tab(session_paths: list[Path]):
 
 
 def render_traffic_social_tab(session_paths: list[Path]):
+    st.subheader("Audience flow")
+    audience = pd.DataFrame([audience_metrics(path) for path in session_paths])
+    if audience.empty:
+        st.info("No audience samples in the selected sessions.")
+    else:
+        audience_columns = [
+            "session_id", "join_rate_per_min", "viewer_growth", "viewer_volatility",
+            "early_avg_viewers", "mid_avg_viewers", "late_avg_viewers",
+            "early_joins", "mid_joins", "late_joins",
+        ]
+        st.dataframe(
+            audience[[column for column in audience_columns if column in audience]],
+            use_container_width=True,
+            hide_index=True,
+        )
+
     traffic = traffic_sources(session_paths)
     st.subheader("Entry source")
     if traffic.empty:
