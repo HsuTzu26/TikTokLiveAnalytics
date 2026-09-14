@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -68,6 +69,7 @@ def start_watcher() -> str:
         return f"Watcher already running (PID {pid})."
 
     WATCHER_PID.parent.mkdir(parents=True, exist_ok=True)
+    WATCHER_PID.unlink(missing_ok=True)
     process = subprocess.Popen(
         [
             sys.executable,
@@ -85,8 +87,19 @@ def start_watcher() -> str:
             else 0
         ),
     )
-    WATCHER_PID.write_text(str(process.pid), encoding="ascii")
-    return f"Watcher started (PID {process.pid})."
+    # watcher.py owns watcher.pid. Do not write the dashboard launcher PID:
+    # the venv launcher may spawn a different Python process and the watcher
+    # would otherwise exit with "already running".
+    for _ in range(30):
+        time.sleep(0.1)
+        pid = watcher_pid()
+        if pid and pid_is_running(pid):
+            return f"Watcher started (PID {pid})."
+        if process.poll() is not None:
+            break
+    if process.poll() is None:
+        return f"Watcher start requested (launcher PID {process.pid}); PID file not ready yet."
+    return f"Watcher failed to start (exit code {process.returncode}); check {WATCHER_LOG}."
 
 
 def stop_watcher() -> str:
@@ -339,6 +352,30 @@ def add_streamer_to_watchlist(raw_username: str) -> str:
     return f"@{username} {action} to watchlist. Watcher will probe it on the next cycle."
 
 
+def remove_streamer_from_watchlist(raw_username: str) -> str:
+    username = raw_username.strip().lstrip("@").strip()
+    if not username:
+        return "Select a streamer first."
+
+    config = read_json(CONFIG_PATH, {"streamers": []})
+    streamers = config.setdefault("streamers", [])
+    before = len(streamers)
+    config["streamers"] = [
+        item for item in streamers
+        if str(item.get("username", "")).lstrip("@").strip() != username
+    ]
+    if len(config["streamers"]) == before:
+        return f"@{username} is not in the watchlist."
+
+    tmp = CONFIG_PATH.with_suffix(".json.tmp")
+    tmp.write_text(
+        json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    tmp.replace(CONFIG_PATH)
+    return f"@{username} removed from watchlist. Captured data was kept."
+
+
 def render_dashboard():
     config = read_json(CONFIG_PATH, {"streamers": []})
     state = read_json(WATCHER_STATE, {"streamers": {}})
@@ -375,6 +412,21 @@ def render_dashboard():
         )
         if st.button("Add / enable streamer", use_container_width=True):
             st.success(add_streamer_to_watchlist(new_streamer))
+            st.rerun()
+
+        configured_streamers = [value for value in streamers if value]
+        remove_streamer = st.selectbox(
+            "Remove streamer",
+            options=configured_streamers or [""],
+            format_func=lambda value: f"@{value}" if value else "No streamer",
+            key="remove_streamer_username",
+        )
+        if st.button(
+            "Remove from watchlist",
+            disabled=not remove_streamer,
+            use_container_width=True,
+        ):
+            st.warning(remove_streamer_from_watchlist(remove_streamer))
             st.rerun()
 
         st.divider()

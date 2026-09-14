@@ -37,16 +37,28 @@ def iter_ndjson(path: Path):
                 yield line_no, None
 
 
-def source_dirs(raw_root: Path):
-    for path in sorted(raw_root.iterdir(), key=lambda item: item.name):
-        if not path.is_dir():
+def source_dirs(raw_root: Path, include_archive: bool = False):
+    roots = [raw_root]
+    if include_archive:
+        archive_root = raw_root / "archive"
+        if archive_root.exists():
+            roots.extend(sorted((item for item in archive_root.iterdir() if item.is_dir()), key=lambda item: item.name))
+    seen = set()
+    for root in roots:
+        if not root.exists():
             continue
-        match = SOURCE_NAME_RE.match(path.name)
-        if not match or not (path / "session.json").exists():
-            continue
-        meta = read_json(path / "session.json", {})
-        username = str(meta.get("username") or match.group("username")).lstrip("@")
-        yield path, match.group("date"), username, meta
+        for path in sorted(root.iterdir(), key=lambda item: item.name):
+            if not path.is_dir():
+                continue
+            if path in seen:
+                continue
+            seen.add(path)
+            match = SOURCE_NAME_RE.match(path.name)
+            if not match or not (path / "session.json").exists():
+                continue
+            meta = read_json(path / "session.json", {})
+            username = str(meta.get("username") or match.group("username")).lstrip("@")
+            yield path, match.group("date"), username, meta
 
 
 def enrich(record, source_id, merged_id, sequence=None):
@@ -60,12 +72,18 @@ def enrich(record, source_id, merged_id, sequence=None):
     return record
 
 
-def merge_group(raw_root: Path, date: str, username: str, sources: list[tuple[Path, dict]], archive: bool):
+def merge_group(raw_root: Path, date: str, username: str, sources: list[tuple[Path, dict]], archive: bool, refresh: bool = False):
     merged_id = f"{date}_{username}"
-    target = raw_root / merged_id
-    if target.exists():
-        raise FileExistsError(f"Target already exists: {target}")
-
+    final_target = raw_root / merged_id
+    if final_target.exists() and not refresh:
+        raise FileExistsError(f"Target already exists: {final_target}; use --refresh to rebuild it")
+    target = final_target
+    temporary_target = None
+    if final_target.exists():
+        temporary_target = raw_root / f".{merged_id}.merge_tmp"
+        if temporary_target.exists():
+            shutil.rmtree(temporary_target)
+        target = temporary_target
     target.mkdir(parents=True)
     source_ids = [path.name for path, _ in sources]
     all_counts = Counter()
@@ -225,10 +243,24 @@ def merge_group(raw_root: Path, date: str, username: str, sources: list[tuple[Pa
             output.write(f"\n===== source_session={source_path.name} =====\n")
             output.write(source_log.read_text(encoding="utf-8", errors="replace"))
 
+    if temporary_target is not None:
+        final_target.mkdir(parents=True, exist_ok=True)
+        for child in temporary_target.iterdir():
+            destination = final_target / child.name
+            if destination.exists():
+                if destination.is_dir():
+                    shutil.rmtree(destination)
+                else:
+                    destination.unlink()
+            shutil.move(str(child), str(destination))
+        temporary_target.rmdir()
+
     if archive:
         archive_root = raw_root / "archive" / date
         archive_root.mkdir(parents=True, exist_ok=True)
         for source_path, _ in sources:
+            if source_path.parent == archive_root:
+                continue
             destination = archive_root / source_path.name
             if destination.exists():
                 raise FileExistsError(f"Archive target already exists: {destination}")
@@ -242,6 +274,7 @@ def merge_group(raw_root: Path, date: str, username: str, sources: list[tuple[Pa
         "users": output_user_count,
         "event_counts": dict(output_counts),
         "archive": archive,
+        "refresh": refresh,
         "bad_lines": dict(bad_lines),
     }, ensure_ascii=False))
 
@@ -253,11 +286,12 @@ def main():
     parser.add_argument("--before", help="Merge all dates before YYYYMMDD.")
     parser.add_argument("--username", help="Only merge one streamer username.")
     parser.add_argument("--archive", action="store_true", help="Move source folders under data/raw/archive after a successful merge.")
+    parser.add_argument("--refresh", action="store_true", help="Rebuild an existing daily aggregate from direct and archived source sessions.")
     args = parser.parse_args()
 
     raw_root = Path(args.raw_root).resolve()
     groups = {}
-    for path, date, username, meta in source_dirs(raw_root):
+    for path, date, username, meta in source_dirs(raw_root, include_archive=args.refresh):
         if args.date and date != args.date:
             continue
         if args.before and date >= args.before:
@@ -270,7 +304,7 @@ def main():
         raise SystemExit("No mergeable source sessions found.")
 
     for (date, username), sources in sorted(groups.items()):
-        merge_group(raw_root, date, username, sources, args.archive)
+        merge_group(raw_root, date, username, sources, args.archive, args.refresh)
 
 
 if __name__ == "__main__":

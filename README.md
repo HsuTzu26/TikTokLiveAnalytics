@@ -74,5 +74,8 @@ The Streamlit dashboard displays all event times in Asia/Taipei. Select a stream
 The merge_daily_sessions.py utility can consolidate sessions into one daily folder per streamer and archives source folders under data/raw/archive/ while preserving source_session_id on every record.
 
 The sidebar also accepts a new streamer username and updates watchlist.json; the running watcher reloads it on the next polling cycle.
+Use “Remove from watchlist” to delete a streamer from future tracking; existing raw sessions are intentionally preserved. When a collector exits with `live_end` or `offline_confirmed`, the watcher automatically refreshes `data/raw/YYYYMMDD_<username>/`, archives source sessions under `data/raw/archive/YYYYMMDD/`, and regenerates the 60-second summary and plots.
+
+The dashboard starts the watcher without pre-creating its PID file; `src/watcher.py` owns that file so adding/enabling streamers does not trigger a false “already running” exit.
 
 The analyzer writes both window_start_local and window_start_utc; plotting prefers the Taiwan-time column. The collector finalizes a session after three consecutive authoritative is not currently live responses, while HTTP 429 and probe timeouts remain retryable.

@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -387,6 +388,70 @@ class Watcher:
         state["collector_started_at_utc"] = None
         state["status"] = "waiting"
 
+    def output_root(self):
+        output_root = Path(self.config["output_root"])
+        if not output_root.is_absolute():
+            output_root = (self.base_dir / output_root).resolve()
+        return output_root
+
+    def latest_finished_source(self, username):
+        root = self.output_root()
+        if not root.exists():
+            return None
+        candidates = []
+        for path in root.iterdir():
+            if not path.is_dir() or not re.match(r"^\d{8}_\d{6}_", path.name):
+                continue
+            meta_path = path / "session.json"
+            if not meta_path.exists():
+                continue
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            if str(meta.get("username") or "").lstrip("@") != username:
+                continue
+            if meta.get("status") not in {"offline_confirmed", "live_end"}:
+                continue
+            candidates.append((str(meta.get("collector_ended_at_utc") or ""), path))
+        return max(candidates, key=lambda item: item[0])[1] if candidates else None
+
+    def aggregate_daily(self, username):
+        source = self.latest_finished_source(username)
+        if source is None:
+            self.log(f"[AGGREGATE] @{username} no finalized source session found")
+            return
+        date = source.name[:8]
+        raw_root = self.output_root()
+        merge_script = (self.base_dir / "src" / "merge_daily_sessions.py").resolve()
+        command = [
+            sys.executable, str(merge_script),
+            "--raw-root", str(raw_root),
+            "--date", date,
+            "--username", username,
+            "--refresh", "--archive",
+        ]
+        result = subprocess.run(
+            command, cwd=str(self.base_dir), capture_output=True, text=True, check=False
+        )
+        if result.returncode != 0:
+            self.log(f"[AGGREGATE] @{username} failed: {result.stderr.strip() or result.stdout.strip()}")
+            return
+
+        target = raw_root / f"{date}_{username}"
+        events_path = target / "events.ndjson"
+        if events_path.exists() and events_path.stat().st_size > 0:
+            for script in ("analyzer.py", "plot_session.py"):
+                analyzer = (self.base_dir / "src" / script).resolve()
+                analyzed = subprocess.run(
+                    [sys.executable, str(analyzer), str(target), "--window", "60"],
+                    cwd=str(self.base_dir), capture_output=True, text=True, check=False
+                )
+                if analyzed.returncode != 0:
+                    self.log(f"[AGGREGATE] @{username} {script} failed: {analyzed.stderr.strip()}")
+                    return
+        self.log(f"[AGGREGATE] @{username} daily={target.name} sources refreshed")
+
     def check_crashed_collectors(self):
         for username, process in list(self.processes.items()):
             code = process.poll()
@@ -401,6 +466,12 @@ class Watcher:
             state = self.states[username]
             state["collector_pid"] = None
             state["collector_started_at_utc"] = None
+
+            finished_source = self.latest_finished_source(username)
+            if finished_source is not None:
+                finished_meta = json.loads((finished_source / "session.json").read_text(encoding="utf-8"))
+                if finished_meta.get("status") in {"offline_confirmed", "live_end"}:
+                    self.aggregate_daily(username)
 
             # If the previous probe still said LIVE, restart after a short
             # delay. The next probe will decide whether collection continues.
