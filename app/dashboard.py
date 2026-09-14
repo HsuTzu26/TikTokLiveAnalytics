@@ -318,6 +318,44 @@ def load_session(session_dir: Path | None):
     return summary
 
 
+def room_session_dirs(username: str, room_id: str | None) -> list[Path]:
+    """Return non-aggregated session fragments captured for one LIVE room."""
+    if not room_id:
+        return []
+    matches = []
+    for path in session_dirs(username):
+        meta = read_json(path / "session.json", {})
+        if str(meta.get("room_id") or "") == str(room_id) and meta.get("status") != "aggregated":
+            matches.append(path)
+    return sorted(matches, key=lambda path: path.name)
+
+
+def combine_session_metrics(paths: list[Path], preferred: Path | None = None):
+    """Combine collector fragments without losing metrics after a restart."""
+    combined = load_session(None)
+    fragments = [load_session(path) for path in paths]
+    for metrics in fragments:
+        combined["counts"].update(metrics["counts"])
+        for key in ("viewers", "viewer_rows", "activity_rows", "recent_chat", "recent_activity"):
+            combined[key].extend(metrics[key])
+        for key in ("likes_observed", "diamonds", "chat", "joins", "follows", "shares", "subscribes", "gifts"):
+            combined[key] += metrics[key]
+        current = metrics.get("like_current_total")
+        if current is not None:
+            combined["like_current_total"] = max(combined["like_current_total"] or 0, current)
+        if combined["like_first_total"] is None and metrics.get("like_first_total") is not None:
+            combined["like_first_total"] = metrics["like_first_total"]
+            combined["like_baseline_estimate"] = metrics["like_baseline_estimate"]
+    combined["likes"] = combined["like_current_total"] if combined["like_current_total"] is not None else combined["likes_observed"]
+    combined["viewer_rows"].sort(key=lambda row: str(row.get("time") or ""))
+    combined["activity_rows"].sort(key=lambda row: str(row.get("time") or ""))
+    combined["recent_chat"] = sorted(combined["recent_chat"], key=lambda row: str(row.get("time") or ""), reverse=True)[:30]
+    combined["recent_activity"] = sorted(combined["recent_activity"], key=lambda row: str(row.get("time") or ""), reverse=True)[:50]
+    combined["session"] = read_json(preferred / "session.json", {}) if preferred else (fragments[-1]["session"] if fragments else None)
+    combined["fragment_count"] = len(paths)
+    return combined
+
+
 def local_timestamp(value):
     if not value:
         return None
@@ -712,16 +750,16 @@ def render_live_tracking(session_dir: Path | None, metrics: dict, streamer_state
         return
     session = metrics.get("session") or {}
     st.caption(
-        f"Live session: {session_dir.name} | status={session.get('status', 'unknown')} | "
-        f"last event={session.get('last_received_at_local') or 'waiting'}"
+        f"Live room: {session.get('room_id') or 'unknown'} | fragments={metrics.get('fragment_count', 1)} | "
+        f"status={session.get('status', 'unknown')} | last event={session.get('last_received_at_local') or 'waiting'}"
     )
     cols = st.columns(6)
     cols[0].metric("Watch status", streamer_state.get("status", "unknown"))
     cols[1].metric("Current viewer", metrics["viewers"][-1] if metrics["viewers"] else "N/A")
     cols[2].metric("Current likes", metrics["like_current_total"] if metrics["like_current_total"] is not None else metrics["likes"])
-    cols[3].metric("Current diamonds", metrics["diamonds"])
+    cols[3].metric("Captured diamonds (room)", int(metrics["diamonds"]))
     cols[4].metric("Chat", metrics["chat"])
-    cols[5].metric("Gift events", metrics["gifts"])
+    cols[5].metric("Gift events (room)", metrics["gifts"])
     if metrics["recent_activity"]:
         st.dataframe(metrics["recent_activity"], use_container_width=True, hide_index=True)
     else:
@@ -831,7 +869,9 @@ def render_dashboard():
     session = metrics["session"] or {}
     streamer_state = states.get(username, {})
     tracking_dir = latest_live_session(username)
-    tracking_metrics = load_session(tracking_dir) if tracking_dir else metrics
+    tracking_room_id = (read_json(tracking_dir / "session.json", {}) or {}).get("room_id") if tracking_dir else None
+    tracking_fragments = room_session_dirs(username, tracking_room_id) if tracking_dir else []
+    tracking_metrics = combine_session_metrics(tracking_fragments, tracking_dir) if tracking_fragments else metrics
     display_metrics = tracking_metrics if tracking_dir and not manual_id.strip() else metrics
     comparison_paths = [
         RAW_ROOT / session_id
@@ -840,6 +880,10 @@ def render_dashboard():
     ]
     if session_dir and session_dir not in comparison_paths:
         comparison_paths.insert(0, session_dir)
+    selected_room_id = session.get("room_id")
+    for fragment in reversed(room_session_dirs(username, selected_room_id)):
+        if fragment not in comparison_paths:
+            comparison_paths.insert(0, fragment)
 
     st.subheader(f"@{username}")
     if session_dir:
