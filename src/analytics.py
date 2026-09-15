@@ -417,6 +417,85 @@ def social_conversion_proxies(session_dirs: list[Path]):
     return pd.DataFrame(rows)
 
 
+def snapshot_history(session_dirs: list[Path]):
+    rows = []
+    for session_dir in session_dirs:
+        path = session_dir / "snapshots.ndjson"
+        if not path.exists():
+            continue
+        with path.open("r", encoding="utf-8", errors="replace") as fp:
+            for line in fp:
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                data = item.get("data") if isinstance(item.get("data"), dict) else {}
+                rows.append({
+                    "session_id": session_dir.name,
+                    "time": item.get("captured_at_local") or item.get("captured_at_utc"),
+                    "source": item.get("source"),
+                    "room_id": item.get("room_id") or data.get("room_id"),
+                    "live": item.get("live") if item.get("live") is not None else data.get("alive"),
+                    "title": item.get("title") or data.get("title"),
+                    "viewer_count": item.get("viewer_count") if item.get("viewer_count") is not None else data.get("user_count"),
+                    "enter_count": item.get("enter_count"),
+                    "like_count": item.get("like_count") if item.get("like_count") is not None else data.get("like_count"),
+                    "share_count": item.get("share_count") if item.get("share_count") is not None else data.get("share_count"),
+                    "error": item.get("error"),
+                })
+    frame = pd.DataFrame(rows)
+    if not frame.empty:
+        frame["time"] = pd.to_datetime(frame["time"], format="mixed", errors="coerce", utc=True).dt.tz_convert(TAIPEI_TZ)
+        frame = frame.sort_values("time").reset_index(drop=True)
+    return frame
+
+
+def ranking_history(session_dirs: list[Path]):
+    rows = []
+    ranking_keys = {"rankings", "ranks", "online_audience", "anchor_rank_list"}
+
+    def lists(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key in ranking_keys and isinstance(child, list):
+                    yield key, child
+                else:
+                    yield from lists(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from lists(child)
+
+    for session_dir in session_dirs:
+        path = session_dir / "rankings.ndjson"
+        if not path.exists():
+            continue
+        with path.open("r", encoding="utf-8", errors="replace") as fp:
+            for line in fp:
+                try:
+                    snapshot = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                for board, entries in lists(snapshot.get("data") or {}):
+                    for position, entry in enumerate(entries, 1):
+                        if not isinstance(entry, dict):
+                            continue
+                        user = entry.get("user") if isinstance(entry.get("user"), dict) else {}
+                        rows.append({
+                            "session_id": session_dir.name,
+                            "time": snapshot.get("captured_at_local") or snapshot.get("captured_at_utc"),
+                            "board": board,
+                            "rank": entry.get("rank") or position,
+                            "user": user.get("display_id") or user.get("uniqueId") or user.get("nickname") or entry.get("user_name"),
+                            "nickname": user.get("nickname"),
+                            "score": entry.get("score") or entry.get("diamond_count") or entry.get("diamonds"),
+                        })
+    frame = pd.DataFrame(rows)
+    if not frame.empty:
+        frame["time"] = pd.to_datetime(frame["time"], format="mixed", errors="coerce", utc=True).dt.tz_convert(TAIPEI_TZ)
+        frame = frame.sort_values(["time", "board", "rank"]).reset_index(drop=True)
+    return frame
+
+
 def build_health_report(session_dir: Path):
     meta = read_json(session_dir / "session.json", {}) or {}
     event_count = 0

@@ -27,6 +27,8 @@ gift_detail = analytics_module.gift_detail
 gift_leaderboard = analytics_module.gift_leaderboard
 social_activity_by_minute = analytics_module.social_activity_by_minute
 social_conversion_proxies = analytics_module.social_conversion_proxies
+snapshot_history = analytics_module.snapshot_history
+ranking_history = analytics_module.ranking_history
 social_summary = analytics_module.social_summary
 traffic_sources = analytics_module.traffic_sources
 
@@ -657,6 +659,62 @@ def render_traffic_social_tab(session_paths: list[Path]):
         st.altair_chart(chart, use_container_width=True)
 
 
+def render_snapshots_tab(session_paths: list[Path]):
+    st.subheader("Room snapshots")
+    snapshots = snapshot_history(session_paths)
+    if snapshots.empty:
+        st.info("No snapshots yet. New Collector sessions capture the public room snapshot every 60 seconds.")
+    else:
+        valid = snapshots[snapshots["error"].isna()].copy()
+        if not valid.empty:
+            latest = valid.iloc[-1]
+            cols = st.columns(5)
+            cols[0].metric("LIVE", "Yes" if latest.get("live") else "No")
+            cols[1].metric("Snapshot viewers", int(latest["viewer_count"]) if pd.notna(latest.get("viewer_count")) else "N/A")
+            cols[2].metric("Entry count", int(latest["enter_count"]) if pd.notna(latest.get("enter_count")) else "N/A")
+            cols[3].metric("Snapshot likes", int(latest["like_count"]) if pd.notna(latest.get("like_count")) else "API key required")
+            cols[4].metric("Snapshot shares", int(latest["share_count"]) if pd.notna(latest.get("share_count")) else "API key required")
+            plot = valid.melt(
+                id_vars=["time", "source"], value_vars=["viewer_count", "like_count", "share_count"],
+                var_name="metric", value_name="value",
+            ).dropna(subset=["value"])
+            if not plot.empty:
+                chart = alt.Chart(plot).mark_line(point=True).encode(
+                    x=alt.X("time:T", title="Taiwan time (Asia/Taipei)", axis=alt.Axis(format="%m-%d %H:%M")),
+                    y=alt.Y("value:Q", title="Snapshot value"),
+                    color=alt.Color("metric:N", title="Metric"),
+                    strokeDash=alt.StrokeDash("source:N", title="Source"),
+                    tooltip=[alt.Tooltip("time:T", format="%Y-%m-%d %H:%M:%S"), "source", "metric", "value"],
+                ).properties(height=320).interactive()
+                st.altair_chart(chart, use_container_width=True)
+        st.dataframe(snapshots.sort_values("time", ascending=False).head(200), use_container_width=True, hide_index=True)
+
+    st.subheader("Dynamic gifter rankings")
+    rankings = ranking_history(session_paths)
+    if rankings.empty:
+        st.info("Ranking snapshots require TIKTOOL_API_KEY. Full audience rankings may also require TIKTOK_COOKIE_HEADER.")
+    else:
+        latest_time = rankings["time"].max()
+        latest = rankings[rankings["time"] == latest_time].sort_values(["board", "rank"])
+        st.caption(f"Latest ranking snapshot: {latest_time}")
+        st.dataframe(latest, use_container_width=True, hide_index=True)
+        chart = alt.Chart(rankings.dropna(subset=["score"])).mark_line(point=True).encode(
+            x=alt.X("time:T", title="Taiwan time (Asia/Taipei)"),
+            y=alt.Y("score:Q", title="Ranking score / diamonds"),
+            color=alt.Color("user:N", title="User"),
+            tooltip=["time:T", "board", "rank", "user", "score"],
+        ).properties(height=340).interactive()
+        st.altair_chart(chart, use_container_width=True)
+
+    catalogs = [path / "gift_catalog.json" for path in session_paths if (path / "gift_catalog.json").exists()]
+    if catalogs:
+        catalog = read_json(catalogs[-1], {})
+        gifts = (catalog.get("data") or {}).get("gifts") or []
+        if gifts:
+            st.subheader("Gift catalog")
+            st.dataframe(pd.DataFrame(gifts), use_container_width=True, hide_index=True)
+
+
 def render_health_tab(session_paths: list[Path]):
     reports = [build_health_report(path) for path in session_paths]
     if not reports:
@@ -941,10 +999,10 @@ def render_dashboard():
             f"captured by this collector. Estimated pre-capture likes: {display_metrics['like_baseline_estimate']}."
         )
 
-    tab_tracking, tab_overview, tab_chat, tab_compare, tab_gifts, tab_traffic, tab_health, tab_quality = st.tabs(
+    tab_tracking, tab_overview, tab_chat, tab_compare, tab_gifts, tab_traffic, tab_snapshots, tab_health, tab_quality = st.tabs(
         [
             "Live tracking", "Trends", "Recent chat", "Multi-session",
-            "Gifts", "Traffic & social", "System health", "Data quality",
+            "Gifts", "Traffic & social", "Snapshots & rankings", "System health", "Data quality",
         ]
     )
     with tab_tracking:
@@ -987,6 +1045,9 @@ def render_dashboard():
 
     with tab_traffic:
         render_traffic_social_tab(comparison_paths)
+
+    with tab_snapshots:
+        render_snapshots_tab(comparison_paths)
 
     with tab_health:
         render_health_tab(comparison_paths)

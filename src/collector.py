@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import os
 import platform
 import re
 import signal
@@ -14,6 +15,11 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from tiktok_live_events import TikTokLive
+
+try:
+    from .snapshots import TikToolSnapshots, public_live_snapshot
+except ImportError:
+    from snapshots import TikToolSnapshots, public_live_snapshot
 
 
 COLLECTOR_VERSION = "0.3"
@@ -344,6 +350,12 @@ def main():
         default=3,
         help="End the session after this many consecutive authoritative offline responses (default: 3)",
     )
+    parser.add_argument(
+        "--snapshot-seconds",
+        type=int,
+        default=60,
+        help="Room/ranking snapshot interval; 0 disables snapshots (default: 60)",
+    )
     args = parser.parse_args()
 
     username = args.username.lstrip("@")
@@ -361,6 +373,9 @@ def main():
     diagnostics_path = session_dir / "diagnostics.ndjson"
     session_path = session_dir / "session.json"
     collector_log_path = session_dir / "collector.log"
+    snapshots_path = session_dir / "snapshots.ndjson"
+    rankings_path = session_dir / "rankings.ndjson"
+    gift_catalog_path = session_dir / "gift_catalog.json"
 
     events_fp = events_path.open(
         "a", encoding="utf-8", buffering=1
@@ -377,6 +392,8 @@ def main():
     collector_log_fp = collector_log_path.open(
         "a", encoding="utf-8", buffering=1
     )
+    snapshots_fp = snapshots_path.open("a", encoding="utf-8", buffering=1)
+    rankings_fp = rankings_path.open("a", encoding="utf-8", buffering=1)
     original_stdout = sys.stdout
     original_stderr = sys.stderr
     sys.stdout = TeeStream(original_stdout, collector_log_fp)
@@ -451,6 +468,12 @@ def main():
         "raw_event_file": raw_events_path.name,
         "raw_event_count": 0,
         "collector_log_file": collector_log_path.name,
+        "snapshot_file": snapshots_path.name,
+        "rankings_file": rankings_path.name,
+        "gift_catalog_file": gift_catalog_path.name,
+        "snapshot_interval_seconds": args.snapshot_seconds,
+        "snapshot_rest_enabled": bool(os.environ.get("TIKTOOL_API_KEY")),
+        "snapshot_cookie_enabled": bool(os.environ.get("TIKTOK_COOKIE_HEADER")),
         "live_end_detected": False,
         "offline_confirmed": False,
         "offline_miss_count": 0,
@@ -966,6 +989,40 @@ def main():
             return
         print(f"[subscribe] {record['unique_id']}")
 
+    def on_ranking_event(event_name, event):
+        captured = now_ms()
+        row = {
+            "source": "websocket_ranking",
+            "event_type": event_name,
+            "session_id": session_id,
+            "room_id": state["room_id"],
+            "captured_at_utc": iso_utc_from_ms(captured),
+            "captured_at_local": iso_local_from_ms(captured, local_tz),
+            "data": event,
+        }
+        rankings_fp.write(json.dumps(row, ensure_ascii=False) + "\n")
+        rankings_fp.flush()
+
+    for ranking_event_name in ("hostBoard", "rankText", "rankUpdate", "hourlyRank", "battleArmies"):
+        live.on(ranking_event_name)(
+            lambda event, name=ranking_event_name: on_ranking_event(name, event)
+        )
+
+    @live.on("giftPanelUpdate")
+    def on_gift_panel_update(event):
+        captured = now_ms()
+        append = {
+            "source": "websocket_gift_catalog",
+            "event_type": "giftPanelUpdate",
+            "session_id": session_id,
+            "room_id": state["room_id"],
+            "captured_at_utc": iso_utc_from_ms(captured),
+            "captured_at_local": iso_local_from_ms(captured, local_tz),
+            "data": event,
+        }
+        snapshots_fp.write(json.dumps(append, ensure_ascii=False) + "\n")
+        snapshots_fp.flush()
+
     @live.on("control")
     def on_control(e):
         record = {
@@ -1153,8 +1210,60 @@ def main():
             )
             await asyncio.sleep(reconnect_delay)
 
+    snapshot_client = TikToolSnapshots()
+
+    def append_snapshot(fp, payload):
+        payload.setdefault("session_id", session_id)
+        payload.setdefault("room_id", state["room_id"])
+        fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        fp.flush()
+
+    async def capture_snapshots():
+        gift_catalog_written = gift_catalog_path.exists() and gift_catalog_path.stat().st_size > 0
+        while True:
+            try:
+                public = await asyncio.to_thread(public_live_snapshot, username)
+                if not state["room_id"] and public.get("room_id"):
+                    state["room_id"] = str(public["room_id"])
+                append_snapshot(snapshots_fp, public)
+            except Exception as exc:
+                append_snapshot(snapshots_fp, {"source": "public_live_page", "error": f"{type(exc).__name__}: {exc}"})
+
+            if snapshot_client.enabled:
+                room_id = state["room_id"]
+                for method, fp in ((snapshot_client.room_info, snapshots_fp), (snapshot_client.rankings, rankings_fp)):
+                    try:
+                        payload = await asyncio.to_thread(method, username, room_id)
+                        append_snapshot(fp, payload)
+                    except Exception as exc:
+                        append_snapshot(fp, {"source": method.__name__, "error": f"{type(exc).__name__}: {exc}"})
+                if not gift_catalog_written:
+                    try:
+                        payload = await asyncio.to_thread(snapshot_client.gift_info, username, room_id)
+                        tmp = gift_catalog_path.with_suffix(".json.tmp")
+                        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                        tmp.replace(gift_catalog_path)
+                        gift_catalog_written = True
+                    except Exception as exc:
+                        append_snapshot(snapshots_fp, {"source": "gift_info", "error": f"{type(exc).__name__}: {exc}"})
+            await asyncio.sleep(max(10, args.snapshot_seconds))
+
+    async def run_with_snapshots():
+        if args.snapshot_seconds <= 0:
+            await run_resilient()
+            return
+        task = asyncio.create_task(capture_snapshots())
+        try:
+            await run_resilient()
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
     try:
-        asyncio.run(run_resilient())
+        asyncio.run(run_with_snapshots())
         if state["live_end_detected"]:
             exit_status = "live_end"
         elif state["offline_confirmed"]:
@@ -1249,6 +1358,8 @@ def main():
         raw_events_fp.close()
         users_fp.close()
         diagnostics_fp.close()
+        snapshots_fp.close()
+        rankings_fp.close()
 
         print()
         print(f"[stopped] status={exit_status}")
