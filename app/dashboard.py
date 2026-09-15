@@ -323,11 +323,23 @@ def room_session_dirs(username: str, room_id: str | None) -> list[Path]:
     if not room_id:
         return []
     matches = []
-    for path in session_dirs(username):
+    candidates = session_dirs(username)
+    archive_root = RAW_ROOT / "archive"
+    if archive_root.exists():
+        candidates.extend(meta.parent for meta in archive_root.rglob("session.json"))
+    seen = set()
+    for path in candidates:
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
         meta = read_json(path / "session.json", {})
-        if str(meta.get("room_id") or "") == str(room_id) and meta.get("status") != "aggregated":
+        meta_username = str(meta.get("username") or "").lstrip("@")
+        if meta_username != username or meta.get("status") == "aggregated":
+            continue
+        if str(meta.get("room_id") or "") == str(room_id):
             matches.append(path)
-    return sorted(matches, key=lambda path: path.name)
+    return sorted(matches, key=lambda path: str(path))
 
 
 def combine_session_metrics(paths: list[Path], preferred: Path | None = None):
@@ -872,7 +884,13 @@ def render_dashboard():
     tracking_room_id = (read_json(tracking_dir / "session.json", {}) or {}).get("room_id") if tracking_dir else None
     tracking_fragments = room_session_dirs(username, tracking_room_id) if tracking_dir else []
     tracking_metrics = combine_session_metrics(tracking_fragments, tracking_dir) if tracking_fragments else metrics
-    display_metrics = tracking_metrics if tracking_dir and not manual_id.strip() else metrics
+    selected_room_id = session.get("room_id")
+    selected_fragments = room_session_dirs(username, selected_room_id)
+    selected_room_metrics = combine_session_metrics(selected_fragments, session_dir) if selected_fragments else metrics
+    if tracking_dir and not manual_id.strip():
+        display_metrics = tracking_metrics
+    else:
+        display_metrics = selected_room_metrics
     comparison_paths = [
         RAW_ROOT / session_id
         for session_id in comparison_ids
@@ -880,8 +898,7 @@ def render_dashboard():
     ]
     if session_dir and session_dir not in comparison_paths:
         comparison_paths.insert(0, session_dir)
-    selected_room_id = session.get("room_id")
-    for fragment in reversed(room_session_dirs(username, selected_room_id)):
+    for fragment in reversed(selected_fragments):
         if fragment not in comparison_paths:
             comparison_paths.insert(0, fragment)
 
