@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 import time
-from collections import Counter
+from collections import Counter, deque
 from pathlib import Path
 
 import altair as alt
@@ -56,6 +56,13 @@ def read_json(path: Path, default):
         return json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return default
+
+
+def read_tail_lines(path: Path, limit: int = 10) -> list[str]:
+    """Read the latest log lines without retaining the whole file."""
+    limit = max(1, int(limit))
+    with path.open("r", encoding="utf-8", errors="replace") as rows:
+        return list(deque((line.rstrip("\r\n") for line in rows), maxlen=limit))
 
 
 def pid_is_running(pid: int | None) -> bool:
@@ -1068,10 +1075,19 @@ def render_dashboard():
         })
 
     st.divider()
-    st.subheader("Watcher log (latest)")
+    log_header, log_control = st.columns([4, 1])
+    log_header.subheader("Watcher log (latest)")
+    log_limit = log_control.number_input(
+        "Lines",
+        min_value=1,
+        max_value=1000,
+        value=10,
+        step=10,
+        key="watcher_log_line_limit",
+    )
     try:
-        log_lines = WATCHER_LOG.read_text(encoding="utf-8").splitlines()
-        st.code("\n".join(log_lines[-80:]) or "(empty)")
+        log_lines = read_tail_lines(WATCHER_LOG, log_limit)
+        st.code("\n".join(log_lines) or "(empty)")
     except OSError:
         st.info("Watcher log is not available.")
 
