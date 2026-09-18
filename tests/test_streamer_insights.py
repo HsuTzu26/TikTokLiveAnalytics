@@ -12,7 +12,7 @@ class CreatorTests(unittest.TestCase):
         self.assertEqual(result['cross_room_engagers'],1)
         self.assertEqual(result['top_share'],75)
         self.assertEqual(result['gifters'],2)
-        self.assertTrue(any(action[0]=='送禮集中' for action in result['actions']))
+        self.assertNotIn('actions',result)
 
     def test_no_gifts(self):
         frame=pd.DataFrame([{'user':'unknown','room_id':'unknown','diamonds':0,'gifts':0,'chat':0,'shares':0,'follows':0,'subscribes':0,'date':'2026-09-11','viewer_count':None,'time':'2026-09-11'}])

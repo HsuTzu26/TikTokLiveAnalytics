@@ -47,14 +47,7 @@ def render_creator_view(events):
             y=alt.Y('user:N',sort='-x',title='送禮者'),tooltip=['user:N','diamonds:Q']).properties(height=250)
         st.altair_chart(chart,use_container_width=True)
         charts.append(('送禮支持分布',chart))
-    st.subheader('需要注意什麼？下一場可以測試什麼？')
-    for title, evidence, action, uncertainty in summary['actions']:
-        with st.container(border=True):
-            st.markdown('**' + title + '**')
-            st.write('依據：' + evidence)
-            st.write('下一場：' + action)
-            st.caption('不確定性：' + uncertainty)
-    return charts, summary['actions']
+    return charts
 
 LABELS = {
     'date': '日期', 'room_id': '直播間 ID', 'chat': '留言數', 'joins': '進場事件',
@@ -138,7 +131,7 @@ def render_reports(root: Path, streamers: list[str]):
     if events.empty or daily.empty:
         st.info('這段期間尚無可分析的人流或互動資料。請改選其他日期；只有系統紀錄的日期不會產生趨勢。')
         return
-    charts, actions = render_creator_view(events)
+    charts = render_creator_view(events)
     st.subheader('有多少人來？有沒有留下來？')
     st.info('官方觀看次數、不重複觀眾及平均觀看時間目前未取得。下方同時觀看曲線可看人流變化，但不能還原每個人是否留下。')
     cols = st.columns(3)
@@ -206,7 +199,7 @@ def render_reports(root: Path, streamers: list[str]):
         st.write(f"排除重複紀錄：{report['quality']['overlapping_records_skipped']:,}；格式錯誤：{report['quality']['invalid_lines']:,}；缺時間戳：{report['quality']['untimed_records']:,}。")
         st.caption('目前尚未計算完整收集覆蓋率，也無法還原官方不重複觀眾、平均觀看時間與未收集事件。')
     stem = f'{username}_{start}_{end}'
-    html = build_streamer_html(username, start, end, report, charts, notes, actions, tables)
+    html = build_streamer_html(username, start, end, report, charts, notes, tables)
     left, right = st.columns(2)
     left.download_button('下載每日統計 CSV', readable_table(daily).to_csv(index=False).encode('utf-8-sig'), f'{stem}.csv', 'text/csv')
     right.download_button('下載圖表報告 HTML', html.encode('utf-8'), f'{stem}.html', 'text/html')
