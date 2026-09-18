@@ -98,3 +98,21 @@ Examples:
 .\.venv\Scripts\python.exe src\health_monitor.py --raw-root data\raw --session 20260914_103005_pubg.esports.official
 ```
 
+# Reports UI
+
+Select **Reports** in the sidebar Page control. Choose a streamer and Week,
+Month, or Custom date range, then click **Generate report**. Weeks run Monday
+through Sunday; all boundaries use Asia/Taipei. For the initial Chloe report,
+select Custom and 2026-09-10 through 2026-09-16.
+
+Reports include daily and room summaries, viewer and interaction trends,
+captured Diamonds, gifter ranking, and observed entry sources. Download daily
+CSV or an HTML report with charts (chart scripts require internet access).
+Overlapping merged/archive/source events are deduplicated using source session
+and sequence. Cross-midnight broadcasts remain grouped by room ID.
+
+These are captured-data reports, not official TikTok totals. Viewer averages
+are sample-based; first/last events are not confirmed broadcast duration.
+Coverage ratio, scheduled generation, and official post-LIVE reconciliation
+are not implemented in this first version. Reports are generated on demand
+and remain in the browser session until regenerated.
