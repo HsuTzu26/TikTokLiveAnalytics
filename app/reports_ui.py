@@ -5,6 +5,55 @@ from pathlib import Path
 import altair as alt
 import streamlit as st
 from src.reports import build_report, period_bounds
+from src.streamer_insights import creator_summary
+
+def render_creator_view(events):
+    summary = creator_summary(events)
+    charts = []
+    st.subheader('觀眾有沒有參與？')
+    cols = st.columns(3)
+    cols[0].metric('參與留言的人', summary['chatters'], help='期間內可辨識的不重複留言帳號；不是不重複觀眾。')
+    cols[1].metric('分享事件', int(events.shares.sum()), help='捕獲的分享事件，不代表不重複分享人數。')
+    cols[2].metric('跨場互動者', summary['cross_room_engagers'], help='選定期間內，至少在兩個已知 Room ID 留言或送禮的可辨識帳號；不是全體回訪觀眾。')
+    st.caption('留言人數比留言筆數更能看出參與範圍。缺少官方不重複觀眾，暫時不計算留言轉換率。')
+    daily = summary['daily']
+    for title, fields, labels in [
+        ('參與範圍：每天有多少人留言、送禮？', ['chatters','gifters'], {'chatters':'留言者','gifters':'送禮者'}),
+        ('粉絲成長訊號：追蹤與訂閱事件', ['follows','subscribes'], {'follows':'追蹤事件','subscribes':'訂閱事件'}),
+    ]:
+        plot = daily.melt(id_vars='date',value_vars=fields,var_name='metric',value_name='count')
+        plot['metric'] = plot.metric.map(labels)
+        chart = alt.Chart(plot).mark_line(point=True).encode(x=alt.X('date:T',title='台灣日期'),
+            y=alt.Y('count:Q',title='觀察人數／事件數'),color=alt.Color('metric:N',title='指標'),
+            tooltip=['date:T','metric:N','count:Q']).properties(height=240)
+        st.subheader(title)
+        st.altair_chart(chart,use_container_width=True)
+        charts.append((title,chart))
+    st.caption('追蹤／訂閱事件是成長訊號，不是官方新增粉絲淨值；每天收集時長不同，不能直接比較轉換率。')
+    st.subheader('支持是否穩定？')
+    cols = st.columns(3)
+    cols[0].metric('可辨識送禮者', summary['gifters'])
+    cols[1].metric('捕獲 Diamonds', f'{events.diamonds.sum():,.0f}', help='不是官方可提領收入。')
+    cols[2].metric('最高送禮者占比', f"{summary['top_share']:.1f}%" if summary['top_share'] is not None else '無可計算資料')
+    st.caption('重點不只是送禮總量，也要看支持來自多少人，是否過度集中於少數帳號。')
+    gifters = events[(events.gifts == 1) & (events.user != 'unknown')].groupby('user').diamonds.sum().sort_values(ascending=False)
+    if not gifters.empty:
+        top = gifters.head(5).rename_axis('user').reset_index()
+        if len(gifters)>5:
+            import pandas as pd
+            top = pd.concat([top,pd.DataFrame([{'user':'其他送禮者合計','diamonds':gifters.iloc[5:].sum()}])],ignore_index=True)
+        chart = alt.Chart(top).mark_bar().encode(x=alt.X('diamonds:Q',title='捕獲 Diamonds'),
+            y=alt.Y('user:N',sort='-x',title='送禮者'),tooltip=['user:N','diamonds:Q']).properties(height=250)
+        st.altair_chart(chart,use_container_width=True)
+        charts.append(('送禮支持分布',chart))
+    st.subheader('需要注意什麼？下一場可以測試什麼？')
+    for title, evidence, action, uncertainty in summary['actions']:
+        with st.container(border=True):
+            st.markdown('**' + title + '**')
+            st.write('依據：' + evidence)
+            st.write('下一場：' + action)
+            st.caption('不確定性：' + uncertainty)
+    return charts, summary['actions']
 
 LABELS = {
     'date': '日期', 'room_id': '直播間 ID', 'chat': '留言數', 'joins': '進場事件',
@@ -52,13 +101,20 @@ def render_reports(root: Path, streamers: list[str]):
                 names.add(name)
         except (OSError, ValueError):
             pass
-    with st.form('report_controls'):
-        cols = st.columns(3)
-        username = cols[0].selectbox('分析哪位直播主？', sorted(names), key='report_username') if names else None
-        mode = cols[1].selectbox('報表期間', ['Week', 'Month', 'Custom'], format_func=lambda x: {'Week':'週報','Month':'月報','Custom':'自訂日期'}[x], help='週報為週一至週日；月報為整個曆月。')
-        anchor = cols[2].date_input('選擇該週／月中的任一天', date.today() - timedelta(days=7))
-        custom = st.date_input('自訂日期範圍（只在自訂模式使用）', (anchor, anchor + timedelta(days=6)))
-        submitted = st.form_submit_button('產生報表', type='primary')
+    cols = st.columns(2)
+    username = cols[0].selectbox('分析哪位直播主？', sorted(names), key='report_username') if names else None
+    mode = cols[1].selectbox('報表期間', ['Week', 'Month', 'Custom'], key='report_period', format_func=lambda x: {'Week':'週報','Month':'月報','Custom':'自訂日期'}[x], help='週報為週一至週日；月報為整個曆月。')
+    anchor = date.today() - timedelta(days=7)
+    custom = None
+    if mode == 'Custom':
+        custom = st.date_input('自訂日期範圍', (anchor, anchor + timedelta(days=6)), key='report_custom_dates')
+        if isinstance(custom, (tuple, list)) and len(custom) == 2:
+            st.caption(f'即將分析：{custom[0]} ～ {custom[1]}（台灣時間）')
+    else:
+        anchor = st.date_input('選擇該週／月中的任一天', anchor, key='report_anchor')
+        preview_start, preview_end = period_bounds(mode, anchor)
+        st.caption(f'即將分析：{preview_start} ～ {preview_end}（台灣時間；週報固定週一至週日）')
+    submitted = st.button('產生報表', type='primary')
     if submitted and username:
         if mode == 'Custom':
             if not isinstance(custom, (tuple, list)) or len(custom) != 2:
@@ -81,12 +137,13 @@ def render_reports(root: Path, streamers: list[str]):
     if events.empty or daily.empty:
         st.info('這段期間尚無可分析的人流或互動資料。請改選其他日期；只有系統紀錄的日期不會產生趨勢。')
         return
-    cols = st.columns(5)
+    charts, actions = render_creator_view(events)
+    st.subheader('有多少人來？有沒有留下來？')
+    st.info('官方觀看次數、不重複觀眾及平均觀看時間目前未取得。下方同時觀看曲線可看人流變化，但不能還原每個人是否留下。')
+    cols = st.columns(3)
     cols[0].metric('觀察到的直播場次', int((rooms.room_id != 'unknown').sum()), help='依不同 Room ID 計算；跨午夜仍算同一場，不含無法辨識的房間。')
     cols[1].metric('最高同時觀看人數', int(events.viewer_count.max()) if events.viewer_count.notna().any() else '無採樣', help='收集期間觀察到的最大人數，不是觀看總次數或不重複觀眾。')
-    cols[2].metric('收集到的留言', f'{int(events.chat.sum()):,}', help='去除重複資料後的留言事件；未收集時段無法回補。')
-    cols[3].metric('捕獲 Diamonds', f'{events.diamonds.sum():,.0f}', help='已完成 Gift 事件的價值加總；不等於可提領收入或官方總餘額。')
-    cols[4].metric('收集期間按讚增量', f'{events.likes.sum():,}', help='加總 Like batches，不是直播間 totalLikes，也不包含追蹤前的按讚。')
+    cols[2].metric('平均同時觀看（採樣）', f'{events.viewer_count.mean():.1f}' if events.viewer_count.notna().any() else '無採樣', help='全部已捕獲樣本取平均；不同場次的採樣頻率與缺口會影響結果，並非官方 ACU。')
     notes = report_insights(report, start, end)
     st.subheader('這份報表的重點')
     for note in notes:
@@ -102,7 +159,6 @@ def render_reports(root: Path, streamers: list[str]):
         viewer = viewer_samples.resample('15min').mean().reset_index()
         resolution = '15 minutes'
     viewer['taipei_time'] = viewer.time.dt.strftime('%Y-%m-%dT%H:%M:%S')
-    charts = []
     if not viewer.empty:
         # Break lines at missing minutes rather than imply continuous collection.
         viewer['segment'] = viewer.viewer_count.isna().cumsum()
@@ -113,11 +169,11 @@ def render_reports(root: Path, streamers: list[str]):
         st.caption(f'每 {resolution} 的樣本平均；空白處為資料缺口。上升代表當時同時觀看人數增加，不能單靠這張圖判定原因。')
         st.altair_chart(chart, use_container_width=True)
         charts.append(('Viewer trend', chart))
-    activity = daily.melt(id_vars='date', value_vars=['chat', 'joins', 'follows', 'shares', 'subscribes'], var_name='metric', value_name='count')
+    activity = daily.melt(id_vars='date', value_vars=['chat', 'follows', 'shares', 'subscribes'], var_name='metric', value_name='count')
     activity['metric'] = activity.metric.map(LABELS)
     chart = alt.Chart(activity).mark_line(point=True).encode(x=alt.X('date:T', title='台灣日期'), y=alt.Y('count:Q', title='收集到的事件數'), color=alt.Color('metric:N', title='互動類型'), tooltip=['date:T', 'metric:N', 'count:Q'])
     st.subheader('互動走勢：觀眾做了什麼？')
-    st.caption('圖例可區分留言、進場、追蹤、分享與訂閱。進場量通常遠大於其他互動；各日期收集時長不同，總量不宜直接當作轉換率。')
+    st.caption('圖例區分留言、追蹤、分享與訂閱；進場事件移到明細，避免高數量掩蓋其他互動。各日期收集時長不同，總量不宜直接當作轉換率。')
     st.altair_chart(chart, use_container_width=True)
     charts.append(('Daily interaction', chart))
     chart = alt.Chart(daily).mark_bar().encode(x=alt.X('date:T', title='台灣日期'), y=alt.Y('diamonds:Q', title='捕獲 Diamonds'), tooltip=['date:T', 'diamonds:Q'])
@@ -126,6 +182,14 @@ def render_reports(root: Path, streamers: list[str]):
     st.altair_chart(chart, use_container_width=True)
     charts.append(('Diamonds', chart))
     sources = events.entry_source.dropna().value_counts().rename_axis('entry_source').reset_index(name='joins')
+    if not sources.empty:
+        st.subheader('人從哪裡來？')
+        st.caption('顯示捕獲到的前 10 種進場來源；同一人重複進入會重複計數，來源缺失的事件不在圖中。')
+        chart = alt.Chart(sources.head(10)).mark_bar().encode(
+            x=alt.X('joins:Q', title='進場事件數'), y=alt.Y('entry_source:N', sort='-x', title='TikTok 來源代碼'),
+            tooltip=['entry_source:N', 'joins:Q']).properties(height=280)
+        st.altair_chart(chart, use_container_width=True)
+        charts.append(('捕獲進場來源', chart))
     tables = [('每日統計', readable_table(daily)), ('各場直播比較（只含選定期間）', readable_table(rooms)), ('送禮者排行（捕獲值）', readable_table(report['gifters'])), ('進場來源', readable_table(sources))]
     for title, table in tables[1:]:
         with st.expander(title):
@@ -147,6 +211,9 @@ def render_reports(root: Path, streamers: list[str]):
     for title, table in tables:
         html += f'<h2>{escape(title)}</h2>' + table.to_html(index=False, escape=True)
     html += '<h2>重點摘要</h2><ul>' + ''.join('<li>' + escape(note) + '</li>' for note in notes) + '</ul>'
+    html += '<h2>下一場測試建議（非因果結論）</h2>'
+    for title, evidence, action, uncertainty in actions:
+        html += '<h3>' + escape(title) + '</h3><p>依據：' + escape(evidence) + '</p><p>下一場：' + escape(action) + '</p><p>不確定性：' + escape(uncertainty) + '</p>'
     for title, chart in charts:
         html += f'<h2>{escape(title)}</h2>' + chart.to_html(fullhtml=False)
     html += '<h2>Source data quality</h2><pre>' + escape(json.dumps(report['quality'], indent=2)) + '</pre></body></html>'
