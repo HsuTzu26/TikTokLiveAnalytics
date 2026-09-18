@@ -854,8 +854,8 @@ def render_dashboard():
 
     page = st.sidebar.radio("Page", ["Dashboard", "Reports"], key="dashboard_page")
     if page == "Reports":
-        from app.reports_ui import render_reports
-        render_reports(RAW_ROOT, streamers)
+        from app.report_runtime import load_reports_ui
+        load_reports_ui().render_reports(RAW_ROOT, streamers)
         return
 
     st.title("TikTok LIVE Analytics")
