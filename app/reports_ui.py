@@ -6,6 +6,7 @@ import altair as alt
 import streamlit as st
 from src.reports import build_report, period_bounds
 from src.streamer_insights import creator_summary
+from src.report_html import build_streamer_html
 
 def render_creator_view(events):
     summary = creator_summary(events)
@@ -205,18 +206,7 @@ def render_reports(root: Path, streamers: list[str]):
         st.write(f"排除重複紀錄：{report['quality']['overlapping_records_skipped']:,}；格式錯誤：{report['quality']['invalid_lines']:,}；缺時間戳：{report['quality']['untimed_records']:,}。")
         st.caption('目前尚未計算完整收集覆蓋率，也無法還原官方不重複觀眾、平均觀看時間與未收集事件。')
     stem = f'{username}_{start}_{end}'
-    # Embed chart fragments, not nested standalone HTML documents.
-    html = '<!DOCTYPE html><html><head><meta charset="utf-8"><title>LIVE Report</title></head><body>'
-    html += f'<h1>{escape(username)} · {start} — {end}</h1><p>Asia/Taipei. Captured data, not official totals. Averages are sample-based; event spans are not broadcast duration. Missing days are not zero.</p>'
-    for title, table in tables:
-        html += f'<h2>{escape(title)}</h2>' + table.to_html(index=False, escape=True)
-    html += '<h2>重點摘要</h2><ul>' + ''.join('<li>' + escape(note) + '</li>' for note in notes) + '</ul>'
-    html += '<h2>下一場測試建議（非因果結論）</h2>'
-    for title, evidence, action, uncertainty in actions:
-        html += '<h3>' + escape(title) + '</h3><p>依據：' + escape(evidence) + '</p><p>下一場：' + escape(action) + '</p><p>不確定性：' + escape(uncertainty) + '</p>'
-    for title, chart in charts:
-        html += f'<h2>{escape(title)}</h2>' + chart.to_html(fullhtml=False)
-    html += '<h2>Source data quality</h2><pre>' + escape(json.dumps(report['quality'], indent=2)) + '</pre></body></html>'
+    html = build_streamer_html(username, start, end, report, charts, notes, actions, tables)
     left, right = st.columns(2)
     left.download_button('下載每日統計 CSV', readable_table(daily).to_csv(index=False).encode('utf-8-sig'), f'{stem}.csv', 'text/csv')
     right.download_button('下載圖表報告 HTML', html.encode('utf-8'), f'{stem}.html', 'text/html')
