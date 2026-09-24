@@ -1,136 +1,95 @@
-# TikTok Live Analytics
+# TikTok LIVE Analytics
 
-??Python ??? TikTok LIVE ????哨?颲???寡??謆????謕??殉次蹌?NDJSON???嚗??塗???蹓賣??????謘踱??
+以 Python 與 Streamlit 建立的本機直播監控、事件收集與分析工具。主要目標是持續收集直播事件、保存原始紀錄，再以 dashboard、趨勢圖與報表呈現實際觀察到的資料。
 
-## ??赤???
+> 本專案是獨立的社群專案，不是 TikTok 或 TikTool 的官方產品，也未獲其背書。TikTok、TikTok LIVE 等名稱與商標屬其各自權利人。
 
-???????輯撒??Python 3.12 ??軋僕?獢???`.venv`??
+## 功能
 
-```powershell
-.\.venv\Scripts\Activate.ps1
-python --version
-python -m pip install -r requirements.txt
-```
+- Watcher 監控多位 streamer，偵測直播狀態並管理 Collector；遇到暫時探測失敗或限流時採退避策略。
+- Collector 透過上游 LIVE 事件 SDK 收集聊天室、進場、觀看人數、Like、Gift、Follow、Share、Subscribe 等可取得事件，保存 NDJSON。
+- Streamlit dashboard 顯示即時狀態、直播趨勢、多場比較、觀眾進場來源、Gift 排行、系統健康度與歷史報表。
+- 直播結束後可整理每日場次資料；支援 CSV 與含圖表的 HTML 報告。
+- 可選擇啟用雙語聊天室 TTS；TTS 讀取既有 Collector 檔案，不會另外建立 TikTok 直播連線。
+- 可選擇使用專用 Chrome 與 Playwright，在人工登入、確認與授權下操作聊天室發送器。
 
-`tiktok-live-events` ????∴???撕? Git ????????editable install ???
-`tiktok_live_events` ????????SDK ?賹????????????????
+## 資料來源、API 與責任界線
 
-## ????鈭
+| 功能 | 實際來源 | 本專案的使用方式與責任界線 |
+|---|---|---|
+| LIVE 即時事件 | TikTool 維護的 **tiktok-live-events Python SDK**，連線至 TikTool WebSocket 服務 **wss://api.tik.tools** | 這不是 TikTok 官方 LIVE API。本專案使用上游 SDK 收取服務提供的事件；事件種類、可用性、限制與 schema 變更會受上游服務影響，無法保證每場或每個事件完整。 |
+| 房間、排行榜與 Gift catalog 快照 | TikTool REST API：**https://api.tik.tools** | **src/snapshots.py** 呼叫 **/webcast/room_info**、**/webcast/rankings**、**/webcast/gift_info**。需設定 **TIKTOOL_API_KEY** 才會啟用 REST 快照；服務方案、配額與回應由 TikTool 管理。 |
+| 排名資料的可選登入資訊 | 使用者提供的 TikTok Cookie header | 只有設定 **TIKTOK_COOKIE_HEADER** 時，程式才會將它作為 **x-cookie-header** 傳給 TikTool API。Cookie 等同敏感登入憑證；請自行評估是否提供，勿提交至 Git，也勿分享含登入資料的瀏覽器設定檔。 |
+| 直播狀態輔助探測 | TikTok 公開 LIVE 網頁 | 程式解析公開頁面 HTML 作為輔助資訊，不是穩定或官方 API；TikTok 改版、地區或流量限制可能使探測失敗。 |
+| 聊天室訊息發送 | TikTok 網頁 UI + 使用者本機 Chrome，透過 Playwright 操作 | 不使用 TikTool 發送 API，也不宣稱呼叫 TikTok 官方發送 API。登入、驗證與直播間確認由使用者手動完成；請只在自己或已取得授權的直播間使用，並自行確認遵守平台條款與當地規範。 |
+| 聊天室語音 | **edge-tts** 開源 Python 套件呼叫 Microsoft Edge 線上語音服務 | 不是本機離線語音。被接受並送去合成的留言文字會離開本機並傳給語音服務；該服務的可用性與限制不由本專案控制。 |
 
-- `src/collector.py`?契??蹇????????獢? `watchlist.json` ?輯撒?????蝛???
-- data/raw/<session>/raw_events.ndjson?垢???SDK ?謍船? event callback ????皜???payload??
-- `src/watcher.py`?垢? `watchlist.json` ?嚗貉?皝?????謚恃??????
-- `src/analyzer.py`?城? `events.ndjson` ?塗??????????CSV ?????JSON??
-- `src/validate_session.py`?垮??鈭行??????diamond ?殷????皝?撢?
-- `src/plot_session.py`?垓???? CSV ?嚗? PNG ?謘踱??
+因此，本專案**沒有直接使用 TikTok 官方開發者 LIVE API**。TikTok 公開頁面與網頁 UI 是資料探測／人工登入操作來源；核心事件與快照依賴的是 TikTool 第三方 SDK／服務。請分別閱讀 TikTool API 條款、TikTok 平台規範及各軟體套件授權。
 
-?哨????
+### API 金鑰與本機資料
 
-```powershell
-python src\collector.py <username>
-python src\watcher.py --config watchlist.json
-python -m streamlit run app\dashboard.py --server.address 127.0.0.1 --server.port 8501
-python src\analyzer.py data\raw\<session>
-python src\validate_session.py data\raw\<session>
-python src\plot_session.py data\raw\<session>
-```
+- **TIKTOOL_API_KEY**：提供給 TikTool SDK／API；快照功能需要此值。不要寫入原始碼或提交到 Git。
+- **TIKTOK_COOKIE_HEADER**：選用；排名請求會將其送至 TikTool。請把它視為可登入帳號的機密資料。
+- 收集事件、Watcher 狀態、TTS 狀態與聊天室發送器資料存放在 **data/**，此目錄由 **.gitignore** 排除，不應推送至 GitHub。
+- **data/chat_sender/chrome_profile/** 含專用 Chrome 的登入狀態與 Cookie，**不要壓縮分享或上傳**。
+- TTS 會將通過篩選的聊天室文字送往 Edge 線上語音服務。使用前請考慮觀眾留言的隱私與告知義務。
 
-????荒??? `data/raw/<session>/`?蹇??獢???watcher log/state ?鞈???蟡??嚗對??
-????鈭止僕 Git ??????
+## Windows 安裝與啟動
 
-## ??秧??對?
+需要 Python 3.12。上游 SDK 是獨立 Git 專案，不會被複製進本 repo；先在此專案根目錄另外 clone：
 
-?撖抆???Git ??曇?拇???????蹓曇澈?堊奕???刻麾?洩tiktok-live-events/` ?踐????豢???Git
-????蹇?????皜?????隡?
+~~~powershell
+git clone https://github.com/tiktool/tiktok-live-events.git
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+~~~
 
-```powershell
-git status
-git -C tiktok-live-events status
-```
+啟動 dashboard：
 
-?獢?????????摹?蹓澗??蹓??賣??嚗? SDK ???????????瘞玲?
-## Runtime behavior
+~~~powershell
+.\.venv\Scripts\python.exe -m streamlit run app\dashboard.py --server.address 127.0.0.1 --server.port 8501
+~~~
 
-- Watcher log timestamps use Asia/Taipei; event/session files keep both UTC and local timestamps.
-- Probe timeouts are non-authoritative. After repeated non-quota probe failures, the watcher may start a collector candidate. HTTP 429/4429 triggers shared quota cooldown instead.
-- Only the SDK response is not currently live is treated as authoritative offline.
-- Legacy collector versions are kept under src/legacy/; src/collector.py is the only supported collector entry point.
+也可以使用專案內的 **run_dashboard.bat**。在 Streamlit 側欄的 Watcher 頁面新增／啟用 streamer；個別 Collector 會由 Watcher 管理。不要另外重複啟動同一個 Collector。
 
-## Dashboard ?????
+執行測試：
 
-?賹? Streamlit??
+~~~powershell
+.\.venv\Scripts\python.exe -m pytest
+~~~
 
-```powershell
-python -m streamlit run app\dashboard.py --server.address 127.0.0.1 --server.port 8501
-```
+## 分析數字如何解讀
 
-?伍??session ??畸??`collector.log`?活atcher ??萇???`data/watcher/watcher.log`??
-Probe timeout ??HTTP 429 ????殉死????謕遙??Collector????詨??瞉??撐??
+- 報表呈現的是程式實際收到並寫入的事件，不是 TikTok 官方整場總數；開播後才開始收集、連線中斷、上游限流或資料來源缺漏都會讓數字偏低。
+- Viewer 趨勢是定時樣本；觀眾進場事件不等於不重複觀眾，也無法推算每位觀眾完整觀看時長。
+- Diamonds 由已捕獲 Gift 事件彙算，不等同 TikTok 後台的最終結算或主播實際可提領收入。
+- 連線健康度反映 Collector 的觀察期間，不是整場直播涵蓋率保證。
 
-## Dashboard analysis
+所有報表日期與圖表時間以 Asia/Taipei 為主。原始事件、系統狀態與快照以 NDJSON／JSON 存放於 **data/**；該資料目錄不屬於 GitHub 原始碼 repo。
 
-The Streamlit dashboard displays all event times in Asia/Taipei. Select a streamer, then either choose an available session or enter its exact Session ID (for example 20260913_195928_chloe_o723_). Trend charts use timestamped X axes with explicit Taiwan-time and metric labels.
+## 專案文件與參考資料
 
-The merge_daily_sessions.py utility can consolidate sessions into one daily folder per streamer and archives source folders under data/raw/archive/ while preserving source_session_id on every record.
+### 專案內文件
 
-The sidebar also accepts a new streamer username and updates watchlist.json; the running watcher reloads it on the next polling cycle.
-Use ?謜鈹move from watchlist??to delete a streamer from future tracking; existing raw sessions are intentionally preserved. When a collector exits with `live_end` or `offline_confirmed`, the watcher automatically refreshes `data/raw/YYYYMMDD_<username>/`, archives source sessions under `data/raw/archive/YYYYMMDD/`, and regenerates the 60-second summary and plots.
+- [專案規劃與分析](TikTok_LIVE_Analytics_Project_Plan.md)
+- [雙語即時 TTS 技術設計（專案提供的 DOCX）](docs/TikTok_LIVE_RealTime_Bilingual_TTS_Technical_Design.docx)
+- [TTS 執行方式與限制](docs/TTS_RUNTIME.md)
+- [聊天室發送器操作與安全說明](CHAT_SENDER.md)
 
-The dashboard starts the watcher without pre-creating its PID file; `src/watcher.py` owns that file so adding/enabling streamers does not trigger a false ?謓ready running??exit.
+### 上游專案與技術文件
 
-The analyzer writes both window_start_local and window_start_utc; plotting prefers the Taiwan-time column. The collector finalizes a session after three consecutive authoritative is not currently live responses. HTTP 429/4429 ends that collector and pauses new requests; ordinary timeouts remain retryable.
-## Analytics and health monitoring
+- [TikTool tiktok-live-events 原始碼與 Python SDK 文件](https://github.com/tiktool/tiktok-live-events)
+- [TikTool LIVE API 文件](https://tik.tools/docs) 與 [WebSocket 指南](https://tik.tools/guides/tiktok-live-websocket)
+- [Playwright Python：persistent browser context](https://playwright.dev/python/docs/api/class-browsertype#browser-type-launch-persistent-context)
+- [edge-tts 開源套件](https://github.com/rany2/edge-tts)
+- [Streamlit 官方文件](https://docs.streamlit.io/)
+- [Altair 官方文件](https://altair-viz.github.io/)
 
-The dashboard now includes multi-session comparison, gift leaderboards with single/repeat/mixed sending patterns, entry-source traffic analysis, and follow/share/subscribe summaries. Select multiple sessions from the sidebar to compare viewer, engagement, and monetization metrics.
-Audience flow analysis now includes join rate per minute, viewer growth, viewer volatility, and early/mid/late live-phase comparisons. These are derived metrics from periodic viewer samples and member entry events.
-Gift analysis now includes Top 1/5/10 diamond concentration, peak gift minute, and same-minute gift/chat/viewer relation.
-Follow/share/subscribe analysis includes Taiwan-time per-minute trends, unique actors, observed events per minute, and events per 100 captured joins. Per-100-join values are explicitly labeled as proxies and are not causal or unique-viewer conversion rates.
-The `Live tracking` tab refreshes the newest running session and shows current viewers, TikTok cumulative `totalLikes`, observed Like batches, captured diamonds, chat, gifts, and the latest event stream. Gift diamonds are derived from confirmed gift events (`diamondCount * repeatCount`); TikTok does not expose a room-wide cumulative diamond field in the current LIVE event payload.
+## 致謝
 
-`src/health_monitor.py` writes `health.json` with connection, reconnect, disconnect, event completeness, unknown-event, SDK error, and socket quality metrics. The watcher refreshes health reports every 60 seconds for active collectors and writes a final report after daily aggregation.
+感謝 TikTool 團隊維護 tiktok-live-events SDK 與 API 文件；感謝 edge-tts、Streamlit、Playwright、Pandas、Altair、Matplotlib 與 Pygame 的維護者及開源貢獻者。本專案使用各上游提供的程式與文件，並不擁有或重新授權其服務、商標或第三方元件。
 
-New Collector sessions also append `snapshots.ndjson` every five minutes by default and preserve WebSocket ranking events in `rankings.ndjson`. Set `TIKTOOL_API_KEY` to enable REST room-info, rankings, and gift-catalog snapshots. Optionally set `TIKTOK_COOKIE_HEADER` for authenticated ranking data. Secrets are read from environment variables and are never written to session files or logs. The Streamlit `Snapshots & rankings` tab supports both current snapshots and historical ranking changes.
+## 授權
 
-Examples:
-
-```powershell
-.\.venv\Scripts\python.exe src\health_monitor.py --raw-root data\raw --all
-.\.venv\Scripts\python.exe src\health_monitor.py --raw-root data\raw --session 20260914_103005_pubg.esports.official
-```
-
-# Reports UI
-
-Select **Reports** in the sidebar Page control. Choose a streamer and Week,
-Month, or Custom date range, then click **Generate report**. Weeks run Monday
-through Sunday; all boundaries use Asia/Taipei. For the initial Chloe report,
-select Custom and 2026-09-10 through 2026-09-16.
-
-Reports include daily and room summaries, viewer and interaction trends,
-captured Diamonds, gifter ranking, and observed entry sources. Download daily
-CSV or an HTML report with charts (chart scripts require internet access).
-Overlapping merged/archive/source events are deduplicated using source session
-and sequence. Cross-midnight broadcasts remain grouped by room ID.
-
-These are captured-data reports, not official TikTok totals. Viewer averages
-are sample-based; first/last events are not confirmed broadcast duration.
-Full-broadcast coverage ratio, scheduled generation, and official post-LIVE
-reconciliation are not implemented. Collector observation-window connection
-coverage is shown in System health; it is not a full-broadcast completeness
-measure. Reports are generated on demand
-and remain in the browser session until regenerated.
-# TikTool connection quota protection
-
-The watcher probes at most one uncollected streamer every 120 seconds by
-default (`probe_min_interval_seconds` in `watchlist.json`). An active collector
-is never stopped merely because a probe fails. On HTTP 429 or WebSocket 4429,
-the collector exits instead of repeatedly reconnecting, and the watcher
-persists a shared pause in `data/watcher/watcher_state.json`. New probes and
-collectors resume after 15 minutes for generic limits, one hour for an
-explicit hourly Sandbox limit, or 24 hours for an explicit daily Demo limit.
-Existing healthy collectors are not interrupted. The dashboard displays the
-pause deadline in Taiwan time. This is a conservative local safeguard, not a
-guarantee that TikTool has reset its quota or that events missed during the
-pause can be recovered.
-Optional room/ranking snapshots now default to every five minutes. Their REST
-requests and public-page checks back off separately on 429, without stopping
-the event WebSocket.
+本專案原始碼依 [MIT License](LICENSE) 授權。此授權不取代上游 SDK／套件各自的授權，也不授予 TikTok 或 TikTool 服務、資料與商標的權利。

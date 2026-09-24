@@ -1,22 +1,34 @@
-# 聊天室發送（測試版）
+# TikTok LIVE 聊天室發送器
 
-1. Streamlit 側欄選擇 `Chat sender`，按「開啟專用 Chrome」。也可雙擊 `open_chat_sender.bat`。
-2. 在專用 Chrome 手動登入 TikTok。不會使用／複製平常 Chrome 的登入設定檔。
-3. 在 Streamlit 輸入 username，開啟指定直播間；手動確認帳號、直播與播放狀態，按「檢查直播間」。
-4. 預覽訊息並勾選確認，按「確認單次發送」。這個按鈕會真的發送留言。
-5. 頁面看到留言且狀態為 `visible_echo` 後，才可啟用排程。第一則在設定間隔後發送；不補發錯過的時段。
+這是選用的本機瀏覽器操作功能。它不建立另一條 LIVE 收集連線，也不呼叫 TikTool 訊息發送 API；它使用 Playwright 操作專用 Chrome 中的 TikTok 網頁。
 
-排程預設關閉，每次最多 20 則、間隔至少 5 分鐘。重啟不恢復排程；關閉專用 Chrome 結束 worker。
-「停止排程」會阻止後續發送，但已在送出中的訊息無法撤回。整個 worker 不控制 Watcher。
+> 只在自己的直播間或已取得明確同意的直播間使用。請遵守 TikTok 當地適用的條款與規範。登入、驗證碼及任何安全檢查都必須由使用者手動處理；本工具不繞過驗證。
 
-`visible_echo` 僅代表 DOM 出現相同文字，不保證 TikTok 伺服器送達。
-結果不明、無法確認影片播放、輸入框不唯一、驗證或下播都會停用排程，需人工檢查。
-直播狀態偵測是保守的網頁啟發式，不是官方狀態來源；網頁改版可能須調整 selector。
-不要繞過驗證或限制。若網站不允許自動化，應停用此功能。
+## 啟動與使用
 
-本機登入資料、狀態與台灣時間紀錄存於 `data/chat_sender/`（已被 Git 忽略）。
-不記錄 Cookie、完整頁面或瀏覽器錯誤內容。紀錄不自動從分析剔除，請避免用測試留言評估互動成效。
+1. 啟動 Streamlit，在側欄選擇「Chat sender」。
+2. 按「開啟專用 Chrome」，在新視窗手動登入 TikTok。也可使用 **open_chat_sender.bat**。
+3. 輸入 streamer username、單行訊息、發送間隔與排程上限，然後開啟指定直播間。
+4. 確認 Chrome 位於指定的 LIVE 房間、帳號正確且直播影片正在播放，再按「檢查直播間」。
+5. 勾選授權確認後，先按「確認單次發送」。只有在同一 streamer 的單次測試完成後，才能啟用定時發送。
+6. 按「停止排程」只會停止聊天室排程，不會停止 Watcher 或 Collector。
 
-依賴安裝：`.venv\Scripts\python.exe -m pip install "playwright>=1.50,<2"`。
-使用本機已安裝的 Chrome（`channel='chrome'`），不必下載 Playwright Chromium。
-專用 persistent context 的依據：[Playwright BrowserType](https://playwright.dev/python/docs/api/class-browsertype#browser-type-launch-persistent-context)。
+訊息間隔最短 5 分鐘；單次排程上限 1–20 則（介面預設每 10 分鐘最多 3 則）。排程不會在 Worker 重啟後自動恢復。
+
+## 發送狀態與限制
+
+- **visible_echo** 表示頁面中觀察到相同文字，不保證 TikTok 伺服器已接受或所有觀眾都看得到。
+- **submitted_unconfirmed** 表示已嘗試送出但無法確認。工具不會自動重送，避免重複留言；請先人工確認聊天室。
+- 找不到唯一輸入框、直播結束、影片未播放、出現驗證或操作例外時，排程會停用並等待人工處理。
+- 既有草稿不會被覆蓋；發送逾時不會觸發自動重試。
+- 聊天室發送紀錄只記錄時間、操作、結果與 streamer username，不記錄留言全文或瀏覽器例外內容。
+
+## 本機登入資料
+
+專用 persistent Chrome profile 存在 **data/chat_sender/chrome_profile/**。其中可能含可登入 TikTok 的 Cookie 與其他瀏覽器狀態：
+
+- 不要提交到 Git。
+- 不要放入 ZIP、雲端硬碟或傳給他人。
+- 若曾意外分享，請登出該 profile 並更新帳號安全憑證。
+
+安裝與 Playwright 使用方式請見 [README](README.md) 與 [Playwright persistent context 文件](https://playwright.dev/python/docs/api/class-browsertype#browser-type-launch-persistent-context)。
