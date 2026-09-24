@@ -92,4 +92,4 @@ py -3.12 -m venv .venv
 
 ## 授權
 
-本專案原始碼依 [MIT License](LICENSE) 授權。此授權不取代上游 SDK／套件各自的授權，也不授予 TikTok 或 TikTool 服務、資料與商標的權利。
+本專案原創程式碼依 [MIT License](LICENSE) 授權。上游 SDK／套件、專案內引用或由專案提供者提供的參考文件，以及直播資料與媒體，仍依各自權利人與適用條款處理；根目錄 MIT 不會自動改變其授權，也不授予 TikTok 或 TikTool 服務、資料與商標的權利。
