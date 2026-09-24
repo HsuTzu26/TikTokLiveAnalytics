@@ -1,5 +1,7 @@
 # TikTok LIVE Analytics
 
+[English README](README.en.md) | 繁體中文
+
 以 Python 與 Streamlit 建立的本機直播監控、事件收集與分析工具。主要目標是持續收集直播事件、保存原始紀錄，再以 dashboard、趨勢圖與報表呈現實際觀察到的資料。
 
 > 本專案是獨立的社群專案，不是 TikTok 或 TikTool 的官方產品，也未獲其背書。TikTok、TikTok LIVE 等名稱與商標屬其各自權利人。
