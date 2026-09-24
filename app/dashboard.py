@@ -42,6 +42,7 @@ WATCHER_PID = DATA_ROOT / "watcher" / "watcher.pid"
 WATCHER_STOP = DATA_ROOT / "watcher" / "watcher.stop"
 CONFIG_PATH = ROOT / "watchlist.json"
 TAIPEI_TZ = "Asia/Taipei"
+LIVE_REFRESH_SECONDS = 2
 
 
 st.set_page_config(
@@ -670,7 +671,7 @@ def render_snapshots_tab(session_paths: list[Path]):
     st.subheader("Room snapshots")
     snapshots = snapshot_history(session_paths)
     if snapshots.empty:
-        st.info("No snapshots yet. New Collector sessions capture the public room snapshot every 60 seconds.")
+        st.info("No snapshots yet. New Collector sessions capture optional room snapshots every five minutes by default; rate limits pause snapshot requests.")
     else:
         valid = snapshots[snapshots["error"].isna()].copy()
         if not valid.empty:
@@ -728,10 +729,15 @@ def render_health_tab(session_paths: list[Path]):
         st.info("No sessions selected for health monitoring.")
         return
     frame = pd.DataFrame(reports)
+    st.caption("連線涵蓋率＝Collector 監控期間內 WebSocket 已連線時間比例；不是整場直播事件完整率。停寫警示表示最近 5 分鐘沒有捕獲事件，低流量直播可能誤報。")
+    stalled = [item for item in reports if item.get('event_stalled')]
+    if stalled:
+        st.warning("停寫警示：" + ", ".join(str(item['session_id']) for item in stalled))
     columns = [
         "session_id", "status", "connection_count", "reconnect_count",
         "disconnect_count", "event_count", "raw_event_count",
         "socket_uptime_ratio", "socket_gap_seconds",
+        "observed_connection_coverage", "last_event_age_seconds", "event_stalled",
         "duplicate_events_dropped", "sdk_error_events",
         "unknown_event_count", "offline_confirmed", "live_end_detected",
     ]
@@ -852,14 +858,34 @@ def render_dashboard():
     ]
     states = state.get("streamers", {})
 
-    page = st.sidebar.radio("Page", ["Dashboard", "Reports"], key="dashboard_page")
+    page = st.sidebar.radio("Page", ["Dashboard", "Reports", "Live TTS", "Chat sender"], key="dashboard_page")
+    if page == "Chat sender":
+        from app.chat_sender_ui import render_chat_sender
+        render_chat_sender()
+        return
+    if page == "Live TTS":
+        import app.tts_ui as tts_ui
+        tts_ui = importlib.reload(tts_ui)
+        tts_ui.render_tts(streamers, states)
+        return
     if page == "Reports":
         from app.report_runtime import load_reports_ui
         load_reports_ui().render_reports(RAW_ROOT, streamers)
         return
 
     st.title("TikTok LIVE Analytics")
-    st.caption("All displayed timestamps use Taiwan time: Asia/Taipei.")
+    st.caption(
+        f"All displayed timestamps use Taiwan time: Asia/Taipei. Live data refreshes every {LIVE_REFRESH_SECONDS} seconds."
+    )
+    quota_until = state.get("quota_pause_until_utc")
+    if quota_until:
+        quota_time = pd.to_datetime(quota_until, utc=True, errors="coerce")
+        if pd.notna(quota_time) and quota_time > pd.Timestamp.now(tz="UTC"):
+            st.warning(
+                "TikTool 配額冷卻中：暫停新直播探測與 Collector 啟動至 "
+                + quota_time.tz_convert(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M 台灣時間")
+                + "。已正常運作的收集連線不受影響。"
+            )
 
     with st.sidebar:
         st.header("Watch control")
@@ -1099,7 +1125,14 @@ def render_dashboard():
 
 
 if hasattr(st, "fragment"):
-    @st.fragment(run_every=5)
+    selected_page = st.session_state.get("dashboard_page", "Dashboard")
+    refresh_interval = (
+        LIVE_REFRESH_SECONDS
+        if selected_page in {"Dashboard", "Live TTS"}
+        else None
+    )
+
+    @st.fragment(run_every=refresh_interval)
     def live_dashboard():
         render_dashboard()
 

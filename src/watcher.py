@@ -7,14 +7,16 @@ import signal
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from tiktok_live_events import TikTokLive
 try:
     from .health_monitor import write_health_report
+    from .quota_policy import classify_limit, pause_until, paused
 except ImportError:
     from health_monitor import write_health_report
+    from quota_policy import classify_limit, pause_until, paused
 
 
 WATCHER_VERSION = "0.2"
@@ -43,6 +45,7 @@ def load_config(path):
         "start_collector_on_probe_error": True,
         "collector_probe_error_cooldown_seconds": 300,
         "health_check_seconds": 60,
+        "probe_min_interval_seconds": 120,
         "streamers": [],
     }
 
@@ -96,7 +99,8 @@ async def probe_live(username, timeout_seconds):
     @live.on("connected")
     def on_connected(_):
         result["connected"] = True
-        result["confirmed_live"] = True
+        # The TikTool edge may accept its socket before checking the room.
+        # Only roomInfo confirms a usable LIVE room.
 
     @live.on("roomInfo")
     def on_room_info(e):
@@ -105,8 +109,9 @@ async def probe_live(username, timeout_seconds):
             result["room_id"] = str(room_id)
         result["ws_host"] = e.get("wsHost")
         result["cluster_region"] = e.get("clusterRegion")
-        result["confirmed_live"] = True
-        live.stop()
+        result["confirmed_live"] = bool(result["room_id"])
+        if result["confirmed_live"]:
+            live.stop()
 
     @live.on("error")
     def on_error(e):
@@ -128,6 +133,9 @@ async def probe_live(username, timeout_seconds):
             live.stop()
         except Exception:
             pass
+
+    if result["connected"] and not result["confirmed_live"] and not result["error"]:
+        result["error"] = "probe_no_room_info"
 
     return result
 
@@ -154,6 +162,13 @@ class Watcher:
 
         self.log_path = self.log_dir / "watcher.log"
         self.state_path = self.log_dir / "watcher_state.json"
+        try:
+            previous_state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            previous_state = {}
+        self.quota_pause_until_utc = previous_state.get("quota_pause_until_utc")
+        self.next_probe_at_utc = previous_state.get("next_probe_at_utc")
+        self.probe_cursor = int(previous_state.get("probe_cursor") or 0)
         self.pid_path = self.log_dir / "watcher.pid"
         self.stop_path = self.log_dir / "watcher.stop"
 
@@ -165,6 +180,7 @@ class Watcher:
         self.processes = {}
         self.fallback_last_started = {}
         self.last_health_check = 0.0
+        self.stalled_collectors = set()
         self.running = True
 
     @staticmethod
@@ -251,6 +267,9 @@ class Watcher:
             "updated_at_utc": utc_now(),
             "config_path": str(self.config_path),
             "streamers": self.states,
+            "quota_pause_until_utc": self.quota_pause_until_utc,
+            "next_probe_at_utc": self.next_probe_at_utc,
+            "probe_cursor": self.probe_cursor,
         }
 
         tmp = self.state_path.with_suffix(".json.tmp")
@@ -259,6 +278,29 @@ class Watcher:
             encoding="utf-8",
         )
         tmp.replace(self.state_path)
+
+    def note_quota(self, kind, source):
+        previous = self.quota_pause_until_utc
+        self.quota_pause_until_utc = pause_until(previous, kind)
+        if self.quota_pause_until_utc != previous:
+            local = datetime.fromisoformat(self.quota_pause_until_utc).astimezone(TAIPEI_TZ)
+            self.log(f"[QUOTA] {kind} from {source}; new probes/collectors paused until {local.isoformat()}")
+
+    def select_probe_target(self, enabled, now=None):
+        now = now or datetime.now(timezone.utc)
+        if paused(self.quota_pause_until_utc, now) or paused(self.next_probe_at_utc, now):
+            return None
+        eligible = [item for item in enabled if not (
+            self.processes.get(item["username"])
+            and self.processes[item["username"]].poll() is None
+        )]
+        if not eligible:
+            return None
+        item = eligible[self.probe_cursor % len(eligible)]
+        self.probe_cursor += 1
+        interval = max(60, int(self.config.get("probe_min_interval_seconds", 120)))
+        self.next_probe_at_utc = (now + timedelta(seconds=interval)).isoformat()
+        return item
 
     def collector_command(self, username):
         collector_script = Path(
@@ -286,6 +328,8 @@ class Watcher:
         ]
 
     def start_collector(self, username, room_id=None):
+        if paused(self.quota_pause_until_utc):
+            return
         existing = self.processes.get(username)
         if existing and existing.poll() is None:
             return
@@ -321,6 +365,12 @@ class Watcher:
         if not self.config.get("start_collector_on_probe_error", True):
             return False
         text = str(error or "").lower()
+        if paused(self.quota_pause_until_utc) or classify_limit(text):
+            return False
+        if self.states[username]["consecutive_misses"] < 2:
+            return False
+        if not text or text == "probe_no_room_info":
+            return False
         # This is the only authoritative negative returned by the SDK. A
         # timeout, 429, or transport error must not prevent collection.
         if "is not currently live" in text:
@@ -492,7 +542,15 @@ class Watcher:
             if source is None:
                 continue
             try:
-                write_health_report(source)
+                report = write_health_report(source)
+                stalled = bool(report.get("event_stalled"))
+                if stalled and username not in self.stalled_collectors:
+                    self.stalled_collectors.add(username)
+                    self.log(f"[STALL] @{username} no captured events for "
+                             f"{report['last_event_age_seconds']:.0f}s; collector kept running")
+                elif not stalled and username in self.stalled_collectors:
+                    self.stalled_collectors.discard(username)
+                    self.log(f"[RECOVER] @{username} event flow resumed")
             except OSError as exc:
                 self.log(f"[HEALTH] @{username} report failed: {exc}")
 
@@ -536,9 +594,20 @@ class Watcher:
                 if finished_meta.get("status") in {"offline_confirmed", "live_end"}:
                     self.aggregate_daily(username)
 
+            latest_source = self.latest_source(username)
+            if latest_source is not None:
+                try:
+                    latest_meta = json.loads((latest_source / "session.json").read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    latest_meta = {}
+                if latest_meta.get("status") == "rate_limited":
+                    self.note_quota(latest_meta.get("rate_limit_kind") or "generic", f"@{username} collector")
+
             # If the previous probe still said LIVE, restart after a short
             # delay. The next probe will decide whether collection continues.
-            if (
+            if paused(self.quota_pause_until_utc):
+                state["status"] = "quota_paused"
+            elif (
                 self.config["restart_collector_on_crash"]
                 and state["consecutive_misses"] == 0
                 and state["last_confirmed_live_at_utc"]
@@ -554,6 +623,12 @@ class Watcher:
 
         state["last_probe_at_utc"] = result["checked_at_utc"]
         state["last_probe_error"] = result["error"]
+
+        limit_kind = classify_limit(result["error"])
+        if limit_kind:
+            self.note_quota(limit_kind, f"@{username} probe")
+            state["status"] = "quota_paused"
+            return
 
         if result["confirmed_live"]:
             state["last_confirmed_live_at_utc"] = result["checked_at_utc"]
@@ -673,17 +748,11 @@ class Watcher:
                 # Do not probe a streamer while its collector is healthy.
                 # Probe failures (429/timeout) are not proof that a LIVE ended
                 # and must never stop an active collection process.
-                probe_targets = [
-                    item for item in enabled
-                    if not (
-                        self.processes.get(item["username"])
-                        and self.processes[item["username"]].poll() is None
-                    )
-                ]
-                if probe_targets:
+                probe_target = self.select_probe_target(enabled)
+                if probe_target:
                     results = asyncio.run(
                         probe_all(
-                            probe_targets,
+                            [probe_target],
                             self.config["probe_timeout_seconds"],
                         )
                     )

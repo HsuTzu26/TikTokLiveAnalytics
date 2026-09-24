@@ -496,8 +496,50 @@ def ranking_history(session_dirs: list[Path]):
     return frame
 
 
-def build_health_report(session_dir: Path):
+def _parse_aware(value):
+    try:
+        stamp = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+        return stamp if stamp.tzinfo is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _connected_coverage(meta, checked_at):
+    start = _parse_aware(meta.get('collector_started_at_utc') or meta.get('collector_started_at_local'))
+    end = _parse_aware(meta.get('collector_ended_at_utc') or meta.get('collector_ended_at_local'))
+    if start is None:
+        return None, None, None
+    end = end or checked_at
+    window = max(0.0, (end - start).total_seconds())
+    spans = []
+    for item in meta.get('connection_history') or []:
+        left = _parse_aware(item.get('connected_at_utc') or item.get('connected_at_local'))
+        right = _parse_aware(item.get('disconnected_at_utc') or item.get('disconnected_at_local')) or end
+        if left is not None and right > left:
+            a, b = max(start, left), min(end, right)
+            if b > a:
+                spans.append((a, b))
+    spans.sort()
+    union = []
+    for left, right in spans:
+        if union and left <= union[-1][1]:
+            union[-1] = (union[-1][0], max(union[-1][1], right))
+        else:
+            union.append((left, right))
+    connected = sum((right - left).total_seconds() for left, right in union)
+    return round(window, 3), round(connected, 3), round(connected / window, 4) if window else None
+
+
+def build_health_report(session_dir: Path, *, checked_at=None, stale_after_seconds=300):
     meta = read_json(session_dir / "session.json", {}) or {}
+    checked_at = checked_at or datetime.now(TAIPEI_TZ)
+    window, connected, coverage = _connected_coverage(meta, checked_at)
+    running = meta.get('status') in ('running', 'collecting')
+    last_event = _parse_aware(meta.get('last_received_at_local') or meta.get('last_received_at_utc'))
+    started = _parse_aware(meta.get('collector_started_at_utc') or meta.get('collector_started_at_local'))
+    age_from = last_event or (started if running else None)
+    age = max(0.0, (checked_at - age_from).total_seconds()) if age_from else None
+    stalled = bool(running and age is not None and age >= stale_after_seconds)
     event_count = 0
     event_types = Counter()
     for event in iter_events(session_dir) or []:
@@ -518,7 +560,14 @@ def build_health_report(session_dir: Path):
         "session_id": meta.get("session_id") or session_dir.name,
         "username": meta.get("username"),
         "status": meta.get("status"),
-        "checked_at_local": datetime.now(TAIPEI_TZ).isoformat(),
+        "checked_at_local": checked_at.astimezone(TAIPEI_TZ).isoformat(),
+        "observed_window_seconds": window,
+        "connected_seconds_in_window": connected,
+        "observed_connection_coverage": coverage,
+        "coverage_scope": "collector_observation_window_not_full_live",
+        "last_event_age_seconds": round(age, 1) if age is not None else None,
+        "event_stalled": stalled,
+        "stale_after_seconds": stale_after_seconds,
         "collector_started_at_local": meta.get("collector_started_at_local"),
         "collector_ended_at_local": meta.get("collector_ended_at_local"),
         "last_received_at_local": meta.get("last_received_at_local"),

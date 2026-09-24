@@ -18,8 +18,10 @@ from tiktok_live_events import TikTokLive
 
 try:
     from .snapshots import TikToolSnapshots, public_live_snapshot
+    from .quota_policy import classify_limit, pause_until, paused
 except ImportError:
     from snapshots import TikToolSnapshots, public_live_snapshot
+    from quota_policy import classify_limit, pause_until, paused
 
 
 COLLECTOR_VERSION = "0.3"
@@ -353,8 +355,8 @@ def main():
     parser.add_argument(
         "--snapshot-seconds",
         type=int,
-        default=60,
-        help="Room/ranking snapshot interval; 0 disables snapshots (default: 60)",
+        default=300,
+        help="Room/ranking snapshot interval; 0 disables snapshots (default: 300)",
     )
     args = parser.parse_args()
 
@@ -412,6 +414,7 @@ def main():
         "dedupe_limit": 250000,
         "duplicate_event_counts": Counter(),
         "rate_limited": False,
+        "rate_limit_kind": None,
         "error_event_count": 0,
         "offline_misses": 0,
         "offline_confirmed": False,
@@ -629,6 +632,8 @@ def main():
 
         event_type = record.get("type", "unknown")
         state["event_counts"][event_type] += 1
+        if event_type in {"chat", "gift", "viewer", "member", "like", "social", "subscribe"}:
+            state["offline_misses"] = 0
 
         events_fp.write(json.dumps(record, ensure_ascii=False) + "\n")
         events_fp.flush()
@@ -697,9 +702,8 @@ def main():
 
     @live.on("connected")
     def on_connected(e):
-        state["offline_misses"] = 0
-        state["offline_confirmed"] = False
-        session_meta["offline_confirmed"] = False
+        # Edge socket acceptance is not proof that the upstream room is LIVE.
+        # Only a substantive room event resets consecutive offline responses.
         received = now_ms()
 
         state["connection_id"] += 1
@@ -1082,6 +1086,11 @@ def main():
         e = e or {}
         state["error_event_count"] += 1
         error_text = str(e.get("error") or e)
+        limit_kind = classify_limit(error_text)
+        if limit_kind:
+            state["rate_limited"] = True
+            state["rate_limit_kind"] = limit_kind
+            live.stop()
         if "is not currently live" in error_text.lower():
             state["offline_misses"] += 1
         else:
@@ -1110,6 +1119,7 @@ def main():
     @live.on("rate_limited")
     def on_rate_limited(e):
         state["rate_limited"] = True
+        state["rate_limit_kind"] = classify_limit(str(e)) or "generic"
         received = now_ms()
 
         row = {
@@ -1220,23 +1230,39 @@ def main():
 
     async def capture_snapshots():
         gift_catalog_written = gift_catalog_path.exists() and gift_catalog_path.stat().st_size > 0
+        public_pause_until = None
+        rest_pause_until = None
         while True:
-            try:
-                public = await asyncio.to_thread(public_live_snapshot, username)
-                if not state["room_id"] and public.get("room_id"):
-                    state["room_id"] = str(public["room_id"])
-                append_snapshot(snapshots_fp, public)
-            except Exception as exc:
-                append_snapshot(snapshots_fp, {"source": "public_live_page", "error": f"{type(exc).__name__}: {exc}"})
+            if not paused(public_pause_until):
+                try:
+                    public = await asyncio.to_thread(public_live_snapshot, username)
+                    if not state["room_id"] and public.get("room_id"):
+                        state["room_id"] = str(public["room_id"])
+                    append_snapshot(snapshots_fp, public)
+                except Exception as exc:
+                    kind = classify_limit(str(exc))
+                    if kind:
+                        public_pause_until = pause_until(public_pause_until, kind)
+                        print(f"[snapshot_pause] public page {kind} until {public_pause_until}")
+                    append_snapshot(snapshots_fp, {"source": "public_live_page", "error": f"{type(exc).__name__}: {exc}"})
 
-            if snapshot_client.enabled:
+            if snapshot_client.enabled and not paused(rest_pause_until):
                 room_id = state["room_id"]
                 for method, fp in ((snapshot_client.room_info, snapshots_fp), (snapshot_client.rankings, rankings_fp)):
                     try:
                         payload = await asyncio.to_thread(method, username, room_id)
                         append_snapshot(fp, payload)
                     except Exception as exc:
+                        kind = classify_limit(str(exc))
+                        if kind:
+                            rest_pause_until = pause_until(rest_pause_until, kind)
+                            print(f"[snapshot_pause] TikTool REST {kind} until {rest_pause_until}")
                         append_snapshot(fp, {"source": method.__name__, "error": f"{type(exc).__name__}: {exc}"})
+                        if kind:
+                            break
+                if paused(rest_pause_until):
+                    await asyncio.sleep(max(10, args.snapshot_seconds))
+                    continue
                 if not gift_catalog_written:
                     try:
                         payload = await asyncio.to_thread(snapshot_client.gift_info, username, room_id)
@@ -1245,6 +1271,10 @@ def main():
                         tmp.replace(gift_catalog_path)
                         gift_catalog_written = True
                     except Exception as exc:
+                        kind = classify_limit(str(exc))
+                        if kind:
+                            rest_pause_until = pause_until(rest_pause_until, kind)
+                            print(f"[snapshot_pause] TikTool REST {kind} until {rest_pause_until}")
                         append_snapshot(snapshots_fp, {"source": "gift_info", "error": f"{type(exc).__name__}: {exc}"})
             await asyncio.sleep(max(10, args.snapshot_seconds))
 
@@ -1281,6 +1311,7 @@ def main():
         ended_ms = now_ms()
 
         session_meta["status"] = exit_status
+        session_meta["rate_limit_kind"] = state["rate_limit_kind"]
         session_meta["error"] = error_text
         session_meta["collector_ended_at_utc"] = iso_utc_from_ms(
             ended_ms

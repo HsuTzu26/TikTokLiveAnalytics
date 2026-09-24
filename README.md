@@ -52,7 +52,7 @@ git -C tiktok-live-events status
 ## Runtime behavior
 
 - Watcher log timestamps use Asia/Taipei; event/session files keep both UTC and local timestamps.
-- probe_timeout and HTTP 429 are non-authoritative. When no collector is active, the watcher starts a resilient collector candidate that keeps retrying with exponential backoff (up to 60 seconds).
+- Probe timeouts are non-authoritative. After repeated non-quota probe failures, the watcher may start a collector candidate. HTTP 429/4429 triggers shared quota cooldown instead.
 - Only the SDK response is not currently live is treated as authoritative offline.
 - Legacy collector versions are kept under src/legacy/; src/collector.py is the only supported collector entry point.
 
@@ -78,7 +78,7 @@ Use ?謜鈹move from watchlist??to delete a streamer from future tracking; exist
 
 The dashboard starts the watcher without pre-creating its PID file; `src/watcher.py` owns that file so adding/enabling streamers does not trigger a false ?謓ready running??exit.
 
-The analyzer writes both window_start_local and window_start_utc; plotting prefers the Taiwan-time column. The collector finalizes a session after three consecutive authoritative is not currently live responses, while HTTP 429 and probe timeouts remain retryable.
+The analyzer writes both window_start_local and window_start_utc; plotting prefers the Taiwan-time column. The collector finalizes a session after three consecutive authoritative is not currently live responses. HTTP 429/4429 ends that collector and pauses new requests; ordinary timeouts remain retryable.
 ## Analytics and health monitoring
 
 The dashboard now includes multi-session comparison, gift leaderboards with single/repeat/mixed sending patterns, entry-source traffic analysis, and follow/share/subscribe summaries. Select multiple sessions from the sidebar to compare viewer, engagement, and monetization metrics.
@@ -89,7 +89,7 @@ The `Live tracking` tab refreshes the newest running session and shows current v
 
 `src/health_monitor.py` writes `health.json` with connection, reconnect, disconnect, event completeness, unknown-event, SDK error, and socket quality metrics. The watcher refreshes health reports every 60 seconds for active collectors and writes a final report after daily aggregation.
 
-New Collector sessions also append `snapshots.ndjson` every 60 seconds and preserve WebSocket ranking events in `rankings.ndjson`. Set `TIKTOOL_API_KEY` to enable REST room-info, rankings, and gift-catalog snapshots. Optionally set `TIKTOK_COOKIE_HEADER` for authenticated ranking data. Secrets are read from environment variables and are never written to session files or logs. The Streamlit `Snapshots & rankings` tab supports both current snapshots and historical ranking changes.
+New Collector sessions also append `snapshots.ndjson` every five minutes by default and preserve WebSocket ranking events in `rankings.ndjson`. Set `TIKTOOL_API_KEY` to enable REST room-info, rankings, and gift-catalog snapshots. Optionally set `TIKTOK_COOKIE_HEADER` for authenticated ranking data. Secrets are read from environment variables and are never written to session files or logs. The Streamlit `Snapshots & rankings` tab supports both current snapshots and historical ranking changes.
 
 Examples:
 
@@ -113,6 +113,24 @@ and sequence. Cross-midnight broadcasts remain grouped by room ID.
 
 These are captured-data reports, not official TikTok totals. Viewer averages
 are sample-based; first/last events are not confirmed broadcast duration.
-Coverage ratio, scheduled generation, and official post-LIVE reconciliation
-are not implemented in this first version. Reports are generated on demand
+Full-broadcast coverage ratio, scheduled generation, and official post-LIVE
+reconciliation are not implemented. Collector observation-window connection
+coverage is shown in System health; it is not a full-broadcast completeness
+measure. Reports are generated on demand
 and remain in the browser session until regenerated.
+# TikTool connection quota protection
+
+The watcher probes at most one uncollected streamer every 120 seconds by
+default (`probe_min_interval_seconds` in `watchlist.json`). An active collector
+is never stopped merely because a probe fails. On HTTP 429 or WebSocket 4429,
+the collector exits instead of repeatedly reconnecting, and the watcher
+persists a shared pause in `data/watcher/watcher_state.json`. New probes and
+collectors resume after 15 minutes for generic limits, one hour for an
+explicit hourly Sandbox limit, or 24 hours for an explicit daily Demo limit.
+Existing healthy collectors are not interrupted. The dashboard displays the
+pause deadline in Taiwan time. This is a conservative local safeguard, not a
+guarantee that TikTool has reset its quota or that events missed during the
+pause can be recovered.
+Optional room/ranking snapshots now default to every five minutes. Their REST
+requests and public-page checks back off separately on 429, without stopping
+the event WebSocket.
