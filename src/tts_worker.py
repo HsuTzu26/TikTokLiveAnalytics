@@ -20,8 +20,10 @@ from src.tts.pipeline import ChatProcessor, PreparedChat, TTSSettings
 ROOT = Path(__file__).resolve().parents[1]
 DATA_ROOT = ROOT / "data" / "tts"
 RAW_ROOT = ROOT / "data" / "raw"
+BENCHMARK_ROOT = ROOT / "data" / "v2_provider_benchmark"
 WATCHER_STATE = ROOT / "data" / "watcher" / "watcher_state.json"
 CONFIG_PATH = DATA_ROOT / "config.json"
+PREVIEW_PATH = DATA_ROOT / "preview_request.json"
 STATE_PATH = DATA_ROOT / "state.json"
 STOP_PATH = DATA_ROOT / "stop.json"
 LOCK_PATH = DATA_ROOT / "worker.lock"
@@ -145,14 +147,28 @@ def find_active_session(
 
 
 class TTSWorker:
-    def __init__(self, username: str):
+    def __init__(self, username: str, session_dir: Path | None = None):
         self.username = username
+        self.benchmark_session_dir = None
+        if session_dir is not None:
+            resolved = session_dir.resolve()
+            if not resolved.is_relative_to(BENCHMARK_ROOT.resolve()):
+                raise ValueError("benchmark session must be under data/v2_provider_benchmark")
+            if not resolved.name.casefold().endswith(f"_{username.casefold()}"):
+                raise ValueError("benchmark session username does not match the worker username")
+            if not (resolved / "events.ndjson").is_file():
+                raise FileNotFoundError("benchmark session has no events.ndjson")
+            self.benchmark_session_dir = resolved
         raw = read_json(CONFIG_PATH, {})
         self.settings = TTSSettings.from_mapping(raw)
         self.processor = ChatProcessor(self.settings)
-        self.queue: asyncio.Queue[tuple[PreparedChat, float]] = asyncio.Queue(
+        self.queue: asyncio.PriorityQueue[
+            tuple[int, int, PreparedChat, float, str]
+        ] = asyncio.PriorityQueue(
             maxsize=self.settings.queue_size
         )
+        self.queue_sequence = 0
+        self.last_preview_id = None
         self.backend = EdgeTTSBackend()
         self.player = PygameAudioPlayer()
         self.session_path: Path | None = None
@@ -161,7 +177,15 @@ class TTSWorker:
         self.first_session = True
         self.metrics = {
             "chat_events_seen": 0,
+            "gift_events_seen": 0,
+            "gift_streak_events_skipped": 0,
+            "chat_queued": 0,
+            "gift_queued": 0,
             "spoken": 0,
+            "chat_spoken": 0,
+            "gift_spoken": 0,
+            "preview_queued": 0,
+            "preview_spoken": 0,
             "synthesis_or_playback_errors": 0,
             "skipped": Counter(),
             "latencies_ms": [],
@@ -177,6 +201,7 @@ class TTSWorker:
         self.state = {
             "pid": os.getpid(),
             "username": username,
+            "source_session_dir": str(self.benchmark_session_dir) if self.benchmark_session_dir else None,
             "status": "starting",
             "started_at_local": now_local(),
             "updated_at_local": now_local(),
@@ -191,7 +216,15 @@ class TTSWorker:
         latency = self.metrics["latencies_ms"]
         self.state["metrics"] = {
             "chat_events_seen": self.metrics["chat_events_seen"],
+            "gift_events_seen": self.metrics["gift_events_seen"],
+            "gift_streak_events_skipped": self.metrics["gift_streak_events_skipped"],
+            "chat_queued": self.metrics["chat_queued"],
+            "gift_queued": self.metrics["gift_queued"],
             "spoken": self.metrics["spoken"],
+            "chat_spoken": self.metrics["chat_spoken"],
+            "gift_spoken": self.metrics["gift_spoken"],
+            "preview_queued": self.metrics["preview_queued"],
+            "preview_spoken": self.metrics["preview_spoken"],
             "synthesis_or_playback_errors": self.metrics[
                 "synthesis_or_playback_errors"
             ],
@@ -230,27 +263,69 @@ class TTSWorker:
         self.session_path = path
         print(f"[tts] following active collector session {path.name}", flush=True)
 
-    def _process_line(self, line: bytes) -> None:
+    async def _process_line(self, line: bytes) -> None:
         try:
             event = json.loads(line.decode("utf-8"))
         except (UnicodeDecodeError, ValueError):
             self.metrics["skipped"]["invalid_event_line"] += 1
             return
-        if not isinstance(event, dict) or event.get("type") != "chat":
+        if not isinstance(event, dict):
             return
 
-        self.metrics["chat_events_seen"] += 1
-        self.metrics["last_chat_at_local"] = event.get("received_at_local")
+        event_type = event.get("type")
+        if event_type == "chat":
+            self.metrics["chat_events_seen"] += 1
+            self.metrics["last_chat_at_local"] = event.get("received_at_local")
+            sticker_message = (
+                event.get("message_kind") == "emote" or bool(event.get("emotes"))
+            )
+            if sticker_message:
+                event["comment"] = str(event.get("comment") or "").strip()
+                if "\u50b3\u9001\u8868\u60c5\u8cbc" not in event["comment"]:
+                    event["comment"] = (
+                        f"{event['comment']}\uff0c\u50b3\u9001\u8868\u60c5\u8cbc"
+                        if event["comment"]
+                        else "\u50b3\u9001\u8868\u60c5\u8cbc"
+                    )
+        elif event_type == "gift":
+            self.metrics["gift_events_seen"] += 1
+            if not event.get("counted", True):
+                self.metrics["gift_streak_events_skipped"] += 1
+                return
+            sender = str(
+                event.get("nickname")
+                or (f"@{event['unique_id']}" if event.get("unique_id") else "\u6709\u89c0\u773e")
+            ).strip()
+            gift_name = str(event.get("gift_name") or "\u79ae\u7269").strip()
+            try:
+                quantity = max(1, int(event.get("repeat_count") or 1))
+            except (TypeError, ValueError):
+                quantity = 1
+            event["comment"] = (
+                f"{sender} \u9001\u51fa {gift_name}\uff0c\u6578\u91cf {quantity} \u500b"
+            )
+        else:
+            return
+
         prepared, reason = self.processor.prepare(event)
         if prepared is None:
             self.metrics["skipped"][reason or "filtered"] += 1
             return
-        try:
-            self.queue.put_nowait((prepared, time.monotonic()))
-        except asyncio.QueueFull:
-            self.metrics["skipped"]["queue_full"] += 1
+        # Backpressure the file reader instead of dropping accepted events.
+        # The append-only event file remains the durable source of truth.
+        event_time = time.monotonic()
+        if prepared.received_at_ms is not None:
+            age_at_enqueue = max(
+                0.0,
+                (time.time() * 1000 - prepared.received_at_ms) / 1000,
+            )
+            event_time -= age_at_enqueue
+        await self.queue.put(
+            (1, self._next_queue_sequence(), prepared, event_time, event_type)
+        )
+        self.metrics[f"{event_type}_queued"] += 1
 
-    def _read_new_events(self) -> None:
+    async def _read_new_events(self) -> None:
         if self.file_handle is None:
             return
         try:
@@ -275,60 +350,160 @@ class TTSWorker:
         self.pending_bytes = rows.pop()
         for row in rows:
             if row.strip():
-                self._process_line(row)
+                await self._process_line(row)
+
+    def _next_queue_sequence(self) -> int:
+        self.queue_sequence += 1
+        return self.queue_sequence
+
+    def _reload_runtime_settings(self) -> None:
+        updated = TTSSettings.from_mapping(read_json(CONFIG_PATH, {}))
+        self.settings = updated
+        self.processor.settings = updated
+
+    def _event_is_stale(
+        self, event_type: str, enqueued_at: float, max_age: float
+    ) -> bool:
+        return (
+            event_type != "preview"
+            and max_age > 0
+            and time.monotonic() - enqueued_at > max_age
+        )
+
+    async def _enqueue_voice_preview(self) -> None:
+        if not PREVIEW_PATH.exists():
+            return
+        processing_path = PREVIEW_PATH.with_name("preview_request.processing.json")
+        try:
+            PREVIEW_PATH.replace(processing_path)
+        except OSError:
+            return
+        try:
+            request = read_json(processing_path, {})
+        finally:
+            processing_path.unlink(missing_ok=True)
+        if not isinstance(request, dict):
+            return
+        preview_id = str(request.get("id") or "")
+        if not preview_id or preview_id == self.last_preview_id:
+            return
+        text = str(request.get("text") or "").strip()
+        voice = str(request.get("voice") or "").strip()
+        if not text or not voice:
+            return
+        message = PreparedChat(
+            user_key=None,
+            text=text,
+            voice=voice,
+            received_at_ms=int(time.time() * 1000),
+        )
+        await self.queue.put(
+            (0, self._next_queue_sequence(), message, time.monotonic(), "preview")
+        )
+        self.last_preview_id = preview_id
+        self.metrics["preview_queued"] += 1
 
     async def _speak(self) -> None:
         while True:
-            item, enqueued_at = await self.queue.get()
-            message = item
+            _, _, message, enqueued_at, event_type = await self.queue.get()
             audio_path = None
             try:
-                if time.monotonic() < self.backend_retry_at:
-                    self.metrics["skipped"]["tts_backend_cooldown"] += 1
+                max_age = self.settings.max_queue_age_seconds
+                expired = False
+                if self._event_is_stale(event_type, enqueued_at, max_age):
+                    self.metrics["skipped"][f"stale_{event_type}"] += 1
                     continue
+                spoken = False
+                for attempt in range(3):
+                    if self._event_is_stale(event_type, enqueued_at, max_age):
+                        self.metrics["skipped"][f"stale_{event_type}"] += 1
+                        expired = True
+                        break
+                    cooldown = self.backend_retry_at - time.monotonic()
+                    if cooldown > 0:
+                        await asyncio.sleep(cooldown)
+                    if self._event_is_stale(event_type, enqueued_at, max_age):
+                        self.metrics["skipped"][f"stale_{event_type}"] += 1
+                        expired = True
+                        break
 
-                remaining = (
-                    self.last_synthesis_request_at
-                    + self.settings.min_request_interval_seconds
-                    - time.monotonic()
-                )
-                if remaining > 0:
-                    await asyncio.sleep(remaining)
-
-                self.metrics["is_speaking"] = True
-                started = time.monotonic()
-                if message.received_at_ms is not None:
-                    self.metrics["latencies_ms"].append(
-                        max(0, int(time.time() * 1000) - message.received_at_ms)
+                    remaining = (
+                        self.last_synthesis_request_at
+                        + self.settings.min_request_interval_seconds
+                        - time.monotonic()
                     )
-                    self.metrics["latencies_ms"] = self.metrics["latencies_ms"][-100:]
-                audio_path = await self.backend.synthesize(
-                    message.text, message.voice, self.settings.rate_percent
-                )
-                self.last_synthesis_request_at = started
-                await self.player.play(audio_path, self.settings.volume)
-                self.backend_failures = 0
-                self.backend_retry_at = 0.0
-                self.metrics["spoken"] += 1
-                self.metrics["last_spoken_at_local"] = now_local()
-                self.metrics["last_error"] = None
-                self.metrics["tts_retry_after_local"] = None
-                queue_wait_ms = int((started - enqueued_at) * 1000)
-                if queue_wait_ms > 0:
-                    print(f"[tts] played message after {queue_wait_ms}ms queue wait", flush=True)
+                    if remaining > 0:
+                        await asyncio.sleep(remaining)
+                    if self._event_is_stale(event_type, enqueued_at, max_age):
+                        self.metrics["skipped"][f"stale_{event_type}"] += 1
+                        expired = True
+                        break
+
+                    self.metrics["is_speaking"] = True
+                    started = time.monotonic()
+                    self.last_synthesis_request_at = started
+                    try:
+                        audio_path = await self.backend.synthesize(
+                            message.text, message.voice, self.settings.rate_percent
+                        )
+                        await self.player.play(audio_path, self.settings.volume)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as error:
+                        self.metrics["synthesis_or_playback_errors"] += 1
+                        self.metrics["last_error"] = type(error).__name__
+                        self.backend_failures += 1
+                        backoff = min(60, 5 * (2 ** min(self.backend_failures - 1, 4)))
+                        self.backend_retry_at = time.monotonic() + backoff
+                        self.metrics["tts_retry_after_local"] = (
+                            datetime.now(TAIPEI_TZ) + timedelta(seconds=backoff)
+                        ).isoformat(timespec="seconds")
+                        print(
+                            f"[tts-error] {type(error).__name__}; retry {attempt + 1}/3",
+                            flush=True,
+                        )
+                        if audio_path is not None:
+                            audio_path.unlink(missing_ok=True)
+                            audio_path = None
+                        self.metrics["is_speaking"] = False
+                        if (
+                            event_type != "preview"
+                            and max_age > 0
+                            and time.monotonic() - enqueued_at > max_age
+                        ):
+                            self.metrics["skipped"][f"stale_{event_type}"] += 1
+                            expired = True
+                            break
+                        continue
+
+                    self.backend_failures = 0
+                    self.backend_retry_at = 0.0
+                    self.metrics["spoken"] += 1
+                    if event_type in {"chat", "gift"}:
+                        self.metrics[f"{event_type}_spoken"] += 1
+                    elif event_type == "preview":
+                        self.metrics["preview_spoken"] += 1
+                    self.metrics["last_spoken_at_local"] = now_local()
+                    self.metrics["last_error"] = None
+                    self.metrics["tts_retry_after_local"] = None
+                    if event_type != "preview" and message.received_at_ms is not None:
+                        event_to_playback_ms = max(
+                            0,
+                            int(time.time() * 1000) - message.received_at_ms,
+                        )
+                        self.metrics["latencies_ms"].append(event_to_playback_ms)
+                        self.metrics["latencies_ms"] = self.metrics["latencies_ms"][-100:]
+                        print(
+                            f"[tts] finished {event_type} after {event_to_playback_ms}ms from event arrival",
+                            flush=True,
+                        )
+                    spoken = True
+                    break
+
+                if not spoken and not expired:
+                    self.metrics["skipped"]["tts_retry_exhausted"] += 1
             except asyncio.CancelledError:
                 raise
-            except Exception as error:
-                # Keep remote error payloads and chat text out of local logs.
-                self.metrics["synthesis_or_playback_errors"] += 1
-                self.metrics["last_error"] = type(error).__name__
-                self.backend_failures += 1
-                backoff = min(60, 5 * (2 ** min(self.backend_failures - 1, 4)))
-                self.backend_retry_at = time.monotonic() + backoff
-                self.metrics["tts_retry_after_local"] = (
-                    datetime.now(TAIPEI_TZ) + timedelta(seconds=backoff)
-                ).isoformat(timespec="seconds")
-                print(f"[tts-error] {type(error).__name__}", flush=True)
             finally:
                 if audio_path is not None:
                     audio_path.unlink(missing_ok=True)
@@ -342,9 +517,12 @@ class TTSWorker:
             return 2
 
         self.player.initialize()
-        existing_session, _ = find_active_session(
-            RAW_ROOT, WATCHER_STATE, self.username
-        )
+        if self.benchmark_session_dir is not None:
+            existing_session = self.benchmark_session_dir
+        else:
+            existing_session, _ = find_active_session(
+                RAW_ROOT, WATCHER_STATE, self.username
+            )
         # A worker launched before a collector exists should read its first
         # session from the beginning. When launched mid-session it seeks EOF.
         self.first_session = existing_session is not None
@@ -354,9 +532,19 @@ class TTSWorker:
         try:
             print(f"[tts] started for @{self.username}; no additional LIVE connection", flush=True)
             while not STOP_PATH.exists():
-                active, status = find_active_session(
-                    RAW_ROOT, WATCHER_STATE, self.username, preferred
-                )
+                self._reload_runtime_settings()
+                await self._enqueue_voice_preview()
+                if self.benchmark_session_dir is not None:
+                    active = (
+                        self.benchmark_session_dir
+                        if (self.benchmark_session_dir / "events.ndjson").is_file()
+                        else None
+                    )
+                    status = "collecting" if active is not None else "waiting_for_session_file"
+                else:
+                    active, status = find_active_session(
+                        RAW_ROOT, WATCHER_STATE, self.username, preferred
+                    )
                 state_values = {}
                 if active is None:
                     if self.file_handle is not None:
@@ -370,7 +558,7 @@ class TTSWorker:
                         self._attach(active)
                         self._tail_position = self.file_handle.tell()
                     preferred = active
-                    self._read_new_events()
+                    await self._read_new_events()
                     current_status = (
                         "speaking" if self.metrics["is_speaking"] else "watching"
                     )
@@ -399,6 +587,11 @@ class TTSWorker:
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--username", required=True)
+    parser.add_argument(
+        "--session-dir",
+        type=Path,
+        help="Tail an explicit benchmark session under data/v2_provider_benchmark.",
+    )
     return parser.parse_args(argv)
 
 
@@ -408,7 +601,7 @@ def main(argv=None) -> int:
     if not username or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_." for char in username):
         print("[tts] invalid streamer username", file=sys.stderr, flush=True)
         return 2
-    worker = TTSWorker(username)
+    worker = TTSWorker(username, session_dir=args.session_dir)
     try:
         return asyncio.run(worker.run())
     except KeyboardInterrupt:
