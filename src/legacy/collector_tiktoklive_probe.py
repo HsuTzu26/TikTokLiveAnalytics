@@ -5,12 +5,14 @@ import time
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from TikTokLive import TikTokLiveClient
 from TikTokLive.events import (
     CommentEvent,
     ConnectEvent,
     DisconnectEvent,
+    EmoteChatEvent,
     FollowEvent,
     GiftEvent,
     JoinEvent,
@@ -54,6 +56,56 @@ def user_fields(user):
         "unique_id": safe_get(user, "unique_id", "uniqueId"),
         "nickname": safe_get(user, "nickname"),
     }
+
+
+EMOTE_IMAGE_HOSTS = (
+    "tiktokcdn.com",
+    "tiktokcdn-us.com",
+    "ibytedtos.com",
+    "byteoversea.com",
+    "ibyteimg.com",
+)
+
+
+def normalized_emotes(values):
+    """Keep compact sticker IDs and HTTPS image URLs from TikTok CDNs."""
+    if not isinstance(values, (list, tuple)):
+        return []
+
+    result = []
+    for value in values[:8]:
+        emote = safe_get(value, "emote", default=value)
+        if emote is None:
+            continue
+        emote_id = safe_get(emote, "emote_id", "uuid", "id")
+        image = safe_get(emote, "image")
+        urls = safe_get(image, "url_list", "urls", default=[])
+        if isinstance(urls, str):
+            urls = [urls]
+
+        image_url = None
+        for candidate in urls if isinstance(urls, (list, tuple)) else []:
+            if not isinstance(candidate, str):
+                continue
+            try:
+                parsed = urlsplit(candidate)
+                host = (parsed.hostname or "").casefold()
+            except ValueError:
+                continue
+            if parsed.scheme == "https" and any(
+                host == suffix or host.endswith(f".{suffix}")
+                for suffix in EMOTE_IMAGE_HOSTS
+            ):
+                image_url = candidate[:2048]
+                break
+
+        if emote_id is None and image_url is None:
+            continue
+        result.append({
+            "emote_id": str(emote_id)[:160] if emote_id is not None else None,
+            "image_url": image_url,
+        })
+    return result
 
 
 def main():
@@ -182,10 +234,29 @@ def main():
                 event, "comment"
             ),
         }
+        emotes = normalized_emotes(safe_get(event, "emotes", default=[]))
+        if emotes:
+            record["emotes"] = emotes
         write_event("chat", record)
         print(
             f"[chat] {record['unique_id']}: "
             f"{record['comment']}"
+        )
+
+    @client.on(EmoteChatEvent)
+    async def on_emote_chat(event: EmoteChatEvent):
+        record = {
+            **user_fields(safe_get(event, "user")),
+            "comment": None,
+            "message_kind": "emote",
+            "emotes": normalized_emotes(
+                safe_get(event, "emote_list", default=[])
+            ),
+        }
+        write_event("chat", record)
+        print(
+            f"[emote] {record['unique_id']}: "
+            f"{len(record['emotes'])} sticker(s)"
         )
 
     @client.on(LikeEvent)

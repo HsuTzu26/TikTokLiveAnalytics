@@ -11,6 +11,17 @@ from dataclasses import asdict, dataclass
 URL_PATTERN = re.compile(r"(?i)\b(?:https?://|www\.)\S+")
 WHITESPACE_PATTERN = re.compile(r"\s+")
 REPEATED_CHARACTER_PATTERN = re.compile(r"(.)\1{5,}")
+ACRONYM_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_])(?:IG|FB|YT|DM|VIP)(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
+ACRONYM_SPOKEN_FORMS = {
+    "IG": "I G",
+    "FB": "F B",
+    "YT": "Y T",
+    "DM": "D M",
+    "VIP": "V I P",
+}
 
 
 @dataclass(frozen=True)
@@ -20,10 +31,11 @@ class TTSSettings:
     rate_percent: int = 5
     volume: int = 75
     max_text_length: int = 80
-    queue_size: int = 10
-    user_cooldown_seconds: float = 4.0
-    duplicate_window_seconds: float = 15.0
-    min_request_interval_seconds: float = 1.0
+    queue_size: int = 500
+    max_queue_age_seconds: float = 5.0
+    user_cooldown_seconds: float = 0.0
+    duplicate_window_seconds: float = 0.0
+    min_request_interval_seconds: float = 0.5
     ignore_emoji: bool = True
     blacklist_terms: tuple[str, ...] = ()
 
@@ -55,15 +67,18 @@ class TTSSettings:
             rate_percent=bounded_int("rate_percent", 5, -50, 100),
             volume=bounded_int("volume", 75, 0, 100),
             max_text_length=bounded_int("max_text_length", 80, 1, 200),
-            queue_size=bounded_int("queue_size", 10, 1, 100),
+            queue_size=bounded_int("queue_size", 500, 1, 5000),
+            max_queue_age_seconds=bounded_float(
+                "max_queue_age_seconds", 5.0, 0.0, 300.0
+            ),
             user_cooldown_seconds=bounded_float(
-                "user_cooldown_seconds", 4.0, 0.0, 300.0
+                "user_cooldown_seconds", 0.0, 0.0, 300.0
             ),
             duplicate_window_seconds=bounded_float(
-                "duplicate_window_seconds", 15.0, 0.0, 600.0
+                "duplicate_window_seconds", 0.0, 0.0, 600.0
             ),
             min_request_interval_seconds=bounded_float(
-                "min_request_interval_seconds", 1.0, 0.5, 30.0
+                "min_request_interval_seconds", 0.5, 0.1, 30.0
             ),
             ignore_emoji=bool(value.get("ignore_emoji", True)),
             blacklist_terms=tuple(
@@ -105,6 +120,11 @@ def clean_chat_text(text: object, *, max_length: int = 80, ignore_emoji: bool = 
         return ""
     value = unicodedata.normalize("NFKC", text)
     value = URL_PATTERN.sub(" ", value)
+    value = value.replace("@", " at ")
+    value = ACRONYM_PATTERN.sub(
+        lambda match: ACRONYM_SPOKEN_FORMS[match.group(0).upper()],
+        value,
+    )
     value = "".join(
         " " if unicodedata.category(char) == "Cc" else char
         for char in value
@@ -170,17 +190,25 @@ class ChatProcessor:
             if previous is not None and now - previous < cooldown:
                 return None, "user_cooldown"
 
+        is_sticker_message = (
+            event.get("message_kind") == "emote" or bool(event.get("emotes"))
+        )
+        duplicate_key = (
+            f"{folded}|{user_key.casefold()}"
+            if is_sticker_message and user_key
+            else folded
+        )
         window = self.settings.duplicate_window_seconds
         if window > 0:
-            previous = self._recent_text.get(folded)
+            previous = self._recent_text.get(duplicate_key)
             if previous is not None and now - previous < window:
                 return None, "duplicate_text"
 
         if user_key:
             self._last_by_user[user_key] = now
         if window > 0:
-            self._recent_text[folded] = now
-            self._recent_text.move_to_end(folded)
+            self._recent_text[duplicate_key] = now
+            self._recent_text.move_to_end(duplicate_key)
             while len(self._recent_text) > 10_000:
                 self._recent_text.popitem(last=False)
 
