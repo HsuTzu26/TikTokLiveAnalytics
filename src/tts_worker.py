@@ -4,11 +4,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
 import sys
 import time
 import uuid
-from collections import Counter
+from collections import Counter, deque
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -28,6 +29,14 @@ STATE_PATH = DATA_ROOT / "state.json"
 STOP_PATH = DATA_ROOT / "stop.json"
 LOCK_PATH = DATA_ROOT / "worker.lock"
 TAIPEI_TZ = ZoneInfo("Asia/Taipei")
+
+
+def percentile_ms(values, percentile: float) -> int | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = max(0, math.ceil((percentile / 100) * len(ordered)) - 1)
+    return int(ordered[index])
 
 
 def now_local() -> str:
@@ -163,11 +172,12 @@ class TTSWorker:
         self.settings = TTSSettings.from_mapping(raw)
         self.processor = ChatProcessor(self.settings)
         self.queue: asyncio.PriorityQueue[
-            tuple[int, int, PreparedChat, float, str]
+            tuple[int, int, PreparedChat, float, float, str]
         ] = asyncio.PriorityQueue(
             maxsize=self.settings.queue_size
         )
         self.queue_sequence = 0
+        self.pending_queue_times: dict[int, float] = {}
         self.last_preview_id = None
         self.backend = EdgeTTSBackend()
         self.player = PygameAudioPlayer()
@@ -187,8 +197,10 @@ class TTSWorker:
             "preview_queued": 0,
             "preview_spoken": 0,
             "synthesis_or_playback_errors": 0,
+            "delivery_failures": 0,
+            "gift_delivery_failures": 0,
             "skipped": Counter(),
-            "latencies_ms": [],
+            "latencies_ms": deque(maxlen=1000),
             "is_speaking": False,
             "last_chat_at_local": None,
             "last_spoken_at_local": None,
@@ -228,13 +240,18 @@ class TTSWorker:
             "synthesis_or_playback_errors": self.metrics[
                 "synthesis_or_playback_errors"
             ],
+            "delivery_failures": self.metrics["delivery_failures"],
+            "gift_delivery_failures": self.metrics["gift_delivery_failures"],
             "skipped": dict(self.metrics["skipped"]),
             "queue_depth": self.queue.qsize(),
             "queue_capacity": self.settings.queue_size,
+            "oldest_queue_age_seconds": self._oldest_queue_age_seconds(),
             "is_speaking": self.metrics["is_speaking"],
             "average_event_to_playback_ms": (
                 round(sum(latency) / len(latency)) if latency else None
             ),
+            "p50_event_to_playback_ms": percentile_ms(latency, 50),
+            "p95_event_to_playback_ms": percentile_ms(latency, 95),
             "last_chat_at_local": self.metrics["last_chat_at_local"],
             "last_spoken_at_local": self.metrics["last_spoken_at_local"],
             "last_error": self.metrics["last_error"],
@@ -242,6 +259,48 @@ class TTSWorker:
         }
         self.state["updated_at_local"] = now_local()
         write_json(STATE_PATH, self.state)
+
+    def _oldest_queue_age_seconds(self) -> float:
+        if not self.pending_queue_times:
+            return 0.0
+        age = time.monotonic() - min(self.pending_queue_times.values())
+        return round(max(0.0, age), 3)
+
+    def _record_worker_stopped_queue(self) -> None:
+        while True:
+            try:
+                _, sequence, _, _, _, event_type = self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            self.pending_queue_times.pop(sequence, None)
+            self.metrics["skipped"]["worker_stopped"] += 1
+            if event_type in {"chat", "gift"}:
+                self.metrics["delivery_failures"] += 1
+                if event_type == "gift":
+                    self.metrics["gift_delivery_failures"] += 1
+            self.queue.task_done()
+
+    async def _enqueue(
+        self,
+        message: PreparedChat,
+        event_type: str,
+        *,
+        event_arrived_at: float,
+        order_at_ms: int,
+    ) -> None:
+        sequence = self._next_queue_sequence()
+        queued_at = time.monotonic()
+        await self.queue.put(
+            (
+                int(order_at_ms),
+                sequence,
+                message,
+                event_arrived_at,
+                queued_at,
+                event_type,
+            )
+        )
+        self.pending_queue_times[sequence] = queued_at
 
     def _close_tail(self) -> None:
         if self.file_handle is not None:
@@ -313,15 +372,14 @@ class TTSWorker:
             return
         # Backpressure the file reader instead of dropping accepted events.
         # The append-only event file remains the durable source of truth.
-        event_time = time.monotonic()
-        if prepared.received_at_ms is not None:
-            age_at_enqueue = max(
-                0.0,
-                (time.time() * 1000 - prepared.received_at_ms) / 1000,
-            )
-            event_time -= age_at_enqueue
-        await self.queue.put(
-            (1, self._next_queue_sequence(), prepared, event_time, event_type)
+        order_at_ms = prepared.received_at_ms or int(time.time() * 1000)
+        now_monotonic = time.monotonic()
+        age_at_enqueue = max(0.0, (time.time() * 1000 - order_at_ms) / 1000)
+        await self._enqueue(
+            prepared,
+            event_type,
+            event_arrived_at=now_monotonic - age_at_enqueue,
+            order_at_ms=order_at_ms,
         )
         self.metrics[f"{event_type}_queued"] += 1
 
@@ -337,7 +395,7 @@ class TTSWorker:
                 position = 0
                 self.pending_bytes = b""
             self.file_handle.seek(position)
-            chunk = self.file_handle.read()
+            chunk = self.file_handle.read(64 * 1024)
             self._tail_position = self.file_handle.tell()
         except OSError:
             self._close_tail()
@@ -362,12 +420,11 @@ class TTSWorker:
         self.processor.settings = updated
 
     def _event_is_stale(
-        self, event_type: str, enqueued_at: float, max_age: float
+        self, event_type: str, event_arrived_at: float
     ) -> bool:
         return (
-            event_type != "preview"
-            and max_age > 0
-            and time.monotonic() - enqueued_at > max_age
+            event_type == "chat"
+            and time.monotonic() - event_arrived_at > self.settings.chat_ttl_seconds
         )
 
     async def _enqueue_voice_preview(self) -> None:
@@ -397,33 +454,38 @@ class TTSWorker:
             voice=voice,
             received_at_ms=int(time.time() * 1000),
         )
-        await self.queue.put(
-            (0, self._next_queue_sequence(), message, time.monotonic(), "preview")
+        now = time.monotonic()
+        now_ms = int(time.time() * 1000)
+        await self._enqueue(
+            message,
+            "preview",
+            event_arrived_at=now,
+            order_at_ms=now_ms,
         )
         self.last_preview_id = preview_id
         self.metrics["preview_queued"] += 1
 
     async def _speak(self) -> None:
         while True:
-            _, _, message, enqueued_at, event_type = await self.queue.get()
+            _, sequence, message, event_arrived_at, _, event_type = await self.queue.get()
+            self.pending_queue_times.pop(sequence, None)
             audio_path = None
             try:
-                max_age = self.settings.max_queue_age_seconds
                 expired = False
-                if self._event_is_stale(event_type, enqueued_at, max_age):
-                    self.metrics["skipped"][f"stale_{event_type}"] += 1
+                if self._event_is_stale(event_type, event_arrived_at):
+                    self.metrics["skipped"]["expired_chat"] += 1
                     continue
                 spoken = False
                 for attempt in range(3):
-                    if self._event_is_stale(event_type, enqueued_at, max_age):
-                        self.metrics["skipped"][f"stale_{event_type}"] += 1
+                    if self._event_is_stale(event_type, event_arrived_at):
+                        self.metrics["skipped"]["expired_chat"] += 1
                         expired = True
                         break
                     cooldown = self.backend_retry_at - time.monotonic()
                     if cooldown > 0:
                         await asyncio.sleep(cooldown)
-                    if self._event_is_stale(event_type, enqueued_at, max_age):
-                        self.metrics["skipped"][f"stale_{event_type}"] += 1
+                    if self._event_is_stale(event_type, event_arrived_at):
+                        self.metrics["skipped"]["expired_chat"] += 1
                         expired = True
                         break
 
@@ -434,8 +496,8 @@ class TTSWorker:
                     )
                     if remaining > 0:
                         await asyncio.sleep(remaining)
-                    if self._event_is_stale(event_type, enqueued_at, max_age):
-                        self.metrics["skipped"][f"stale_{event_type}"] += 1
+                    if self._event_is_stale(event_type, event_arrived_at):
+                        self.metrics["skipped"]["expired_chat"] += 1
                         expired = True
                         break
 
@@ -446,6 +508,16 @@ class TTSWorker:
                         audio_path = await self.backend.synthesize(
                             message.text, message.voice, self.settings.rate_percent
                         )
+                        if event_type in {"chat", "gift"} and message.received_at_ms is not None:
+                            event_to_playback_ms = max(
+                                0,
+                                int(time.time() * 1000) - message.received_at_ms,
+                            )
+                            self.metrics["latencies_ms"].append(event_to_playback_ms)
+                            print(
+                                f"[tts] playback starting {event_type} after {event_to_playback_ms}ms from event arrival",
+                                flush=True,
+                            )
                         await self.player.play(audio_path, self.settings.volume)
                     except asyncio.CancelledError:
                         raise
@@ -466,12 +538,8 @@ class TTSWorker:
                             audio_path.unlink(missing_ok=True)
                             audio_path = None
                         self.metrics["is_speaking"] = False
-                        if (
-                            event_type != "preview"
-                            and max_age > 0
-                            and time.monotonic() - enqueued_at > max_age
-                        ):
-                            self.metrics["skipped"][f"stale_{event_type}"] += 1
+                        if self._event_is_stale(event_type, event_arrived_at):
+                            self.metrics["skipped"]["expired_chat"] += 1
                             expired = True
                             break
                         continue
@@ -486,23 +554,20 @@ class TTSWorker:
                     self.metrics["last_spoken_at_local"] = now_local()
                     self.metrics["last_error"] = None
                     self.metrics["tts_retry_after_local"] = None
-                    if event_type != "preview" and message.received_at_ms is not None:
-                        event_to_playback_ms = max(
-                            0,
-                            int(time.time() * 1000) - message.received_at_ms,
-                        )
-                        self.metrics["latencies_ms"].append(event_to_playback_ms)
-                        self.metrics["latencies_ms"] = self.metrics["latencies_ms"][-100:]
-                        print(
-                            f"[tts] finished {event_type} after {event_to_playback_ms}ms from event arrival",
-                            flush=True,
-                        )
                     spoken = True
                     break
 
                 if not spoken and not expired:
-                    self.metrics["skipped"]["tts_retry_exhausted"] += 1
+                    self.metrics["delivery_failures"] += 1
+                    self.metrics["skipped"]["backend_error"] += 1
+                    if event_type == "gift":
+                        self.metrics["gift_delivery_failures"] += 1
             except asyncio.CancelledError:
+                self.metrics["skipped"]["worker_stopped"] += 1
+                if event_type in {"chat", "gift"}:
+                    self.metrics["delivery_failures"] += 1
+                    if event_type == "gift":
+                        self.metrics["gift_delivery_failures"] += 1
                 raise
             finally:
                 if audio_path is not None:
@@ -575,6 +640,7 @@ class TTSWorker:
                 await playback_task
             except asyncio.CancelledError:
                 pass
+            self._record_worker_stopped_queue()
             self.player.stop()
             self.player.close()
             self._close_tail()

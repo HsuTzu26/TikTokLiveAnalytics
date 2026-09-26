@@ -32,7 +32,7 @@ class TTSSettings:
     volume: int = 75
     max_text_length: int = 80
     queue_size: int = 500
-    max_queue_age_seconds: float = 5.0
+    chat_ttl_seconds: float = 8.0
     user_cooldown_seconds: float = 0.0
     duplicate_window_seconds: float = 0.0
     min_request_interval_seconds: float = 0.5
@@ -61,6 +61,9 @@ class TTSSettings:
         if not isinstance(blacklist, (list, tuple)):
             blacklist = ()
 
+        if "chat_ttl_seconds" not in value and "max_queue_age_seconds" in value:
+            value = {**value, "chat_ttl_seconds": value["max_queue_age_seconds"]}
+
         return cls(
             zh_voice=str(value.get("zh_voice") or cls.zh_voice).strip()[:100],
             en_voice=str(value.get("en_voice") or cls.en_voice).strip()[:100],
@@ -68,8 +71,10 @@ class TTSSettings:
             volume=bounded_int("volume", 75, 0, 100),
             max_text_length=bounded_int("max_text_length", 80, 1, 200),
             queue_size=bounded_int("queue_size", 500, 1, 5000),
-            max_queue_age_seconds=bounded_float(
-                "max_queue_age_seconds", 5.0, 0.0, 300.0
+            # Read the previous setting name so an existing local config keeps
+            # its chosen Chat age when upgrading to the reliability-first rule.
+            chat_ttl_seconds=bounded_float(
+                "chat_ttl_seconds", 8.0, 5.0, 15.0
             ),
             user_cooldown_seconds=bounded_float(
                 "user_cooldown_seconds", 0.0, 0.0, 300.0

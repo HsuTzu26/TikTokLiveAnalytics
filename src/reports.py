@@ -5,6 +5,7 @@ import json
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from collections.abc import Iterable
 import pandas as pd
 
 TZ = ZoneInfo('Asia/Taipei')
@@ -25,14 +26,32 @@ def event_key(event, folder):
     clean = {k: v for k, v in event.items() if k not in {'session_id', 'source_session_id', 'source_seq', 'seq', 'connection_id'}}
     return hashlib.sha256(json.dumps(clean, sort_keys=True).encode()).hexdigest()
 
-def build_report(root: Path, username: str, start: date, end: date):
+def _source_roots(roots: Path | str | Iterable[Path | str]) -> list[Path]:
+    if isinstance(roots, (str, Path)):
+        return [Path(roots)]
+    return [Path(root) for root in roots]
+
+
+def _session_metadata_paths(roots: Path | str | Iterable[Path | str]):
+    seen = set()
+    for root in _source_roots(roots):
+        for metadata_name in ("session.json", "summary.json"):
+            for metadata_path in sorted(root.rglob(metadata_name)):
+                resolved = metadata_path.resolve()
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                yield metadata_path
+
+
+def build_report(roots: Path | str | Iterable[Path | str], username: str, start: date, end: date):
     if start > end:
         raise ValueError('Start date must not be after end date.')
     lower = datetime.combine(start, time.min, TZ)
     upper = datetime.combine(end + timedelta(days=1), time.min, TZ)
     seen, rows = set(), []
     duplicates = invalid = missing_time = 0
-    for meta_path in sorted(root.rglob('session.json')):
+    for meta_path in _session_metadata_paths(roots):
         try:
             meta = json.loads(meta_path.read_text(encoding='utf-8'))
         except (OSError, ValueError):
@@ -82,8 +101,8 @@ def build_report(root: Path, username: str, start: date, end: date):
                     'chat': int(kind == 'chat'), 'joins': int(kind == 'member'),
                     'likes': int(event.get('like_count') or 0) if kind == 'like' else 0,
                     'gifts': int(counted), 'diamonds': float(event.get('diamond_total') or 0) if counted else 0,
-                    'follows': int(kind == 'social' and event.get('social_action') == 'follow'),
-                    'shares': int(kind == 'social' and event.get('social_action') == 'share'), 'subscribes': int(kind == 'subscribe'),
+                    'follows': int((kind == 'social' and event.get('social_action') == 'follow') or kind == 'follow'),
+                    'shares': int((kind == 'social' and event.get('social_action') == 'share') or kind == 'share'), 'subscribes': int(kind == 'subscribe'),
                     'entry_source': event.get('entry_source') if kind == 'member' else None})
     frame = pd.DataFrame(rows)
     quality = {'overlapping_records_skipped': duplicates, 'invalid_lines': invalid, 'untimed_records': missing_time,

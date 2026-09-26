@@ -1,6 +1,7 @@
 import json
 import asyncio
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -14,7 +15,7 @@ from src.tts.pipeline import (
 from src import tts_worker
 
 
-class TTSChatPipelineTests(unittest.TestCase):
+class TTSChatPipelineTests(unittest.IsolatedAsyncioTestCase):
     def test_cleaning_removes_urls_emoji_and_limits_length(self):
         self.assertEqual(
             clean_chat_text("你好 😊 https://example.com nice", max_length=10),
@@ -27,7 +28,10 @@ class TTSChatPipelineTests(unittest.TestCase):
         self.assertEqual(dominant_language("hi 今天"), "zh-TW")
 
     def test_user_cooldown_and_duplicate_window_are_enforced(self):
-        processor = ChatProcessor(TTSSettings())
+        processor = ChatProcessor(TTSSettings(
+            user_cooldown_seconds=5,
+            duplicate_window_seconds=10,
+        ))
         first, reason = processor.prepare(
             {"comment": "hello", "unique_id": "viewer1"}, now=100
         )
@@ -65,9 +69,18 @@ class TTSChatPipelineTests(unittest.TestCase):
         self.assertEqual(settings.volume, 100)
         self.assertEqual(settings.queue_size, 1)
         self.assertEqual(settings.rate_percent, -50)
-        self.assertEqual(settings.min_request_interval_seconds, 0.5)
+        self.assertEqual(settings.min_request_interval_seconds, 0.1)
+        self.assertEqual(settings.chat_ttl_seconds, 8.0)
         self.assertEqual(settings.blacklist_terms, ("a", "b"))
         self.assertEqual(TTSSettings.from_mapping(settings.to_mapping()), settings)
+        self.assertEqual(
+            TTSSettings.from_mapping({"max_queue_age_seconds": 12}).chat_ttl_seconds,
+            12.0,
+        )
+        self.assertEqual(
+            TTSSettings.from_mapping({"chat_ttl_seconds": 40}).chat_ttl_seconds,
+            15.0,
+        )
 
     def test_state_json_write_retries_transient_windows_file_lock(self):
         real_replace = tts_worker.os.replace
@@ -91,7 +104,7 @@ class TTSChatPipelineTests(unittest.TestCase):
             })
             self.assertEqual(len(attempts), 3)
 
-    def test_ndjson_chat_is_enqueued_and_full_queue_drops_new_message(self):
+    async def test_ndjson_chat_is_enqueued_and_full_queue_backpressures_reader(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.json"
             settings = TTSSettings(
@@ -110,15 +123,27 @@ class TTSChatPipelineTests(unittest.TestCase):
                     "unique_id": user,
                     "received_at_ms": 1_800_000_000_000,
                 }
-                worker._process_line(json.dumps(event).encode("utf-8"))
+                if comment == "hello":
+                    await worker._process_line(json.dumps(event).encode("utf-8"))
+                else:
+                    blocked_put = asyncio.create_task(
+                        worker._process_line(json.dumps(event).encode("utf-8"))
+                    )
+                    await asyncio.sleep(0)
+                    self.assertFalse(blocked_put.done())
 
             self.assertEqual(worker.metrics["chat_events_seen"], 2)
             self.assertEqual(worker.queue.qsize(), 1)
-            self.assertEqual(worker.metrics["skipped"]["queue_full"], 1)
-            queued_message, _ = worker.queue.get_nowait()
+            _, _, queued_message, _, _, _ = worker.queue.get_nowait()
+            worker.queue.task_done()
+            await blocked_put
             self.assertEqual(queued_message.text, "hello")
+            self.assertEqual(worker.queue.qsize(), 1)
+            _, _, queued_message, _, _, _ = worker.queue.get_nowait()
+            worker.queue.task_done()
+            self.assertEqual(queued_message.text, "world")
 
-    def test_mid_session_attach_skips_existing_chat_backlog(self):
+    async def test_mid_session_attach_skips_existing_chat_backlog(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             config_path = root / "config.json"
@@ -138,15 +163,141 @@ class TTSChatPipelineTests(unittest.TestCase):
             new_event = {"type": "chat", "comment": "new chat", "unique_id": "new"}
             with event_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(new_event) + "\n")
-            worker._read_new_events()
+            await worker._read_new_events()
 
             self.assertEqual(worker.metrics["chat_events_seen"], 1)
-            queued_message, _ = worker.queue.get_nowait()
+            _, _, queued_message, _, _, _ = worker.queue.get_nowait()
+            worker.queue.task_done()
             self.assertEqual(queued_message.text, "new chat")
             worker._close_tail()
 
+    async def test_chat_ttl_does_not_expire_captured_gifts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.json"
+            config_path.write_text(json.dumps(TTSSettings().to_mapping()), encoding="utf-8")
+            with patch.object(tts_worker, "CONFIG_PATH", config_path):
+                worker = tts_worker.TTSWorker("test_streamer")
+
+            old_event_time = time.monotonic() - 60
+            self.assertTrue(worker._event_is_stale("chat", old_event_time))
+            self.assertFalse(worker._event_is_stale("gift", old_event_time))
+
+    async def test_stopping_with_a_queued_gift_records_delivery_failure(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.json"
+            config_path.write_text(json.dumps(TTSSettings().to_mapping()), encoding="utf-8")
+            with patch.object(tts_worker, "CONFIG_PATH", config_path):
+                worker = tts_worker.TTSWorker("test_streamer")
+            gift = {
+                "type": "gift", "nickname": "Gift sender", "gift_name": "Rose",
+                "repeat_count": 1, "counted": True,
+                "received_at_ms": int(time.time() * 1000),
+            }
+            await worker._process_line(json.dumps(gift).encode("utf-8"))
+            worker._record_worker_stopped_queue()
+
+            self.assertEqual(worker.metrics["gift_delivery_failures"], 1)
+            self.assertEqual(worker.metrics["skipped"]["worker_stopped"], 1)
+
+    async def test_queue_orders_chat_and_gift_by_event_time(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.json"
+            config_path.write_text(json.dumps(TTSSettings().to_mapping()), encoding="utf-8")
+            with patch.object(tts_worker, "CONFIG_PATH", config_path):
+                worker = tts_worker.TTSWorker("test_streamer")
+
+            now_ms = int(time.time() * 1000)
+            later_chat = {
+                "type": "chat", "comment": "later chat", "unique_id": "viewer",
+                "received_at_ms": now_ms + 200,
+            }
+            earlier_gift = {
+                "type": "gift", "nickname": "Gift sender", "gift_name": "Rose",
+                "repeat_count": 1, "counted": True, "received_at_ms": now_ms + 100,
+            }
+            await worker._process_line(json.dumps(later_chat).encode("utf-8"))
+            await worker._process_line(json.dumps(earlier_gift).encode("utf-8"))
+
+            _, _, first, _, _, first_type = worker.queue.get_nowait()
+            worker.queue.task_done()
+            _, _, second, _, _, second_type = worker.queue.get_nowait()
+            worker.queue.task_done()
+            self.assertEqual((first_type, first.text), ("gift", "Gift sender 送出 Rose,數量 1 個"))
+            self.assertEqual((second_type, second.text), ("chat", "later chat"))
+
 
 class TTSWorkerOfflineIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_old_chat_expires_but_old_captured_gift_is_delivered(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_path = root / "config.json"
+            settings = TTSSettings(
+                user_cooldown_seconds=0,
+                duplicate_window_seconds=0,
+                min_request_interval_seconds=0.1,
+                chat_ttl_seconds=8,
+            )
+            config_path.write_text(json.dumps(settings.to_mapping()), encoding="utf-8")
+
+            class FakeBackend:
+                def __init__(self):
+                    self.texts = []
+
+                async def synthesize(self, text, voice, rate_percent):
+                    self.texts.append(text)
+                    handle = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+                    handle.close()
+                    return Path(handle.name)
+
+            class FakePlayer:
+                async def play(self, audio_path, volume):
+                    pass
+
+                def stop(self):
+                    pass
+
+                def close(self):
+                    pass
+
+            with patch.object(tts_worker, "CONFIG_PATH", config_path), patch.object(
+                tts_worker, "STATE_PATH", root / "state.json"
+            ):
+                worker = tts_worker.TTSWorker("test_streamer")
+            backend = FakeBackend()
+            worker.backend = backend
+            worker.player = FakePlayer()
+            now_ms = int(time.time() * 1000)
+            gift = {
+                "type": "gift", "nickname": "Gift sender", "gift_name": "Rose",
+                "repeat_count": 1, "counted": True,
+                "received_at_ms": now_ms - 30_000,
+            }
+            chat = {
+                "type": "chat", "comment": "old chat", "unique_id": "viewer",
+                "received_at_ms": now_ms - 12_000,
+            }
+            await worker._process_line(json.dumps(gift).encode("utf-8"))
+            await worker._process_line(json.dumps(chat).encode("utf-8"))
+
+            playback = asyncio.create_task(worker._speak())
+            deadline = asyncio.get_running_loop().time() + 3
+            while (
+                worker.metrics["gift_spoken"] < 1
+                or worker.metrics["skipped"]["expired_chat"] < 1
+            ) and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.02)
+            playback.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await playback
+
+            self.assertEqual(backend.texts, ["Gift sender 送出 Rose,數量 1 個"])
+            self.assertEqual(worker.metrics["skipped"]["expired_chat"], 1)
+            self.assertEqual(worker.metrics["gift_delivery_failures"], 0)
+            with patch.object(tts_worker, "STATE_PATH", root / "state.json"):
+                worker.update_state("test")
+            saved_state = json.loads((root / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(saved_state["metrics"]["p50_event_to_playback_ms"], saved_state["metrics"]["p95_event_to_playback_ms"])
+
     async def test_worker_speaks_only_new_chat_without_external_services(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

@@ -11,6 +11,20 @@ from src.watcher import Watcher, probe_live
 
 
 class QuotaPolicyTests(unittest.TestCase):
+    def test_raw_capture_is_opt_in_through_watcher_configuration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / 'watchlist.json'
+            config.write_text(json.dumps({'streamers': [{'username': 'demo'}]}), encoding='utf-8')
+            watcher = Watcher(config)
+            self.assertNotIn('--capture-raw', watcher.collector_command('demo'))
+
+            config.write_text(json.dumps({
+                'capture_raw_events': True,
+                'streamers': [{'username': 'demo'}],
+            }), encoding='utf-8')
+            watcher = Watcher(config)
+            self.assertIn('--capture-raw', watcher.collector_command('demo'))
+
     def test_edge_connection_alone_does_not_confirm_live(self):
         class EdgeOnly:
             def __init__(self, *args, **kwargs):

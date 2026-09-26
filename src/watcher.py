@@ -9,18 +9,24 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
-from tiktok_live_events import TikTokLive
 try:
-    from .health_monitor import write_health_report
     from .quota_policy import classify_limit, pause_until, paused
+    from .rotating_log import append_rotating_text
 except ImportError:
-    from health_monitor import write_health_report
     from quota_policy import classify_limit, pause_until, paused
+    from rotating_log import append_rotating_text
 
 
 WATCHER_VERSION = "0.2"
-TAIPEI_TZ = ZoneInfo("Asia/Taipei")
+TAIPEI_TZ = timezone(timedelta(hours=8), name="Asia/Taipei")
+
+
+def _write_health_report(session_dir):
+    try:
+        from .health_monitor import write_health_report
+    except ImportError:
+        from health_monitor import write_health_report
+    return write_health_report(session_dir)
 
 
 def utc_now():
@@ -46,11 +52,24 @@ def load_config(path):
         "collector_probe_error_cooldown_seconds": 300,
         "health_check_seconds": 60,
         "probe_min_interval_seconds": 120,
+        "log_max_bytes": 5 * 1024 * 1024,
+        "log_backup_count": 3,
+        "capture_raw_events": False,
         "streamers": [],
     }
 
     for key, value in defaults.items():
         config.setdefault(key, value)
+
+    try:
+        config["log_max_bytes"] = max(0, int(config["log_max_bytes"]))
+    except (TypeError, ValueError):
+        config["log_max_bytes"] = defaults["log_max_bytes"]
+    try:
+        config["log_backup_count"] = max(0, int(config["log_backup_count"]))
+    except (TypeError, ValueError):
+        config["log_backup_count"] = defaults["log_backup_count"]
+    config["capture_raw_events"] = config["capture_raw_events"] is True
 
     normalized = []
     for item in config["streamers"]:
@@ -75,7 +94,7 @@ async def probe_live(username, timeout_seconds):
     """
     Lightweight LIVE probe.
 
-    A successful TikTools WebSocket connection / roomInfo means LIVE.
+    A successful TikTokLive WebSocket connection with a room ID means LIVE.
     Failure / timeout is reported as not-confirmed rather than authoritative
     TikTok 'offline', because this is an unofficial endpoint.
     """
@@ -90,53 +109,53 @@ async def probe_live(username, timeout_seconds):
         "checked_at_utc": utc_now(),
     }
 
-    live = TikTokLive(
-        username,
-        auto_reconnect=False,
-        max_reconnect_attempts=0,
-    )
+    try:
+        from TikTokLive import TikTokLiveClient
+        from TikTokLive.client.errors import UserOfflineError
+        from TikTokLive.events import ConnectEvent
+    except ImportError as exc:
+        result["error"] = f"TikTokLive unavailable: {exc}"
+        return result
 
-    @live.on("connected")
-    def on_connected(_):
+    client = TikTokLiveClient(unique_id=f"@{username}")
+    connected = asyncio.Event()
+
+    @client.on(ConnectEvent)
+    async def on_connected(event):
         result["connected"] = True
-        # The TikTool edge may accept its socket before checking the room.
-        # Only roomInfo confirms a usable LIVE room.
-
-    @live.on("roomInfo")
-    def on_room_info(e):
-        room_id = e.get("roomId")
+        room_id = getattr(event, "room_id", None) or client.room_id
         if room_id is not None:
             result["room_id"] = str(room_id)
-        result["ws_host"] = e.get("wsHost")
-        result["cluster_region"] = e.get("clusterRegion")
         result["confirmed_live"] = bool(result["room_id"])
-        if result["confirmed_live"]:
-            live.stop()
-
-    @live.on("error")
-    def on_error(e):
-        result["error"] = str(e.get("error") or e)
+        connected.set()
 
     try:
+        probe_started = time.monotonic()
         await asyncio.wait_for(
-            live.run(),
-            timeout=timeout_seconds,
+            client.start(fetch_live_check=True), timeout=timeout_seconds
         )
+        remaining = max(0.0, timeout_seconds - (time.monotonic() - probe_started))
+        await asyncio.wait_for(connected.wait(), timeout=remaining)
     except asyncio.TimeoutError:
-        result["error"] = result["error"] or "probe_timeout"
+        result["error"] = "probe_timeout"
+    except UserOfflineError:
+        result["error"] = "User is not currently live"
     except Exception as exc:
         result["error"] = (
             f"{type(exc).__name__}: {exc}"
         )
     finally:
         try:
-            live.stop()
+            await asyncio.wait_for(
+                client.disconnect(close_client=True), timeout=3
+            )
         except Exception:
             pass
 
     if result["connected"] and not result["confirmed_live"] and not result["error"]:
         result["error"] = "probe_no_room_info"
 
+    result["checked_at_utc"] = utc_now()
     return result
 
 
@@ -152,9 +171,10 @@ async def probe_all(streamers, timeout_seconds):
 
 
 class Watcher:
-    def __init__(self, config_path):
+    def __init__(self, config_path, *, probe_only=False):
         self.config_path = Path(config_path)
         self.config = load_config(self.config_path)
+        self.probe_only = bool(probe_only)
 
         self.base_dir = self.config_path.parent.resolve()
         self.log_dir = self.base_dir / "data" / "watcher"
@@ -258,8 +278,12 @@ class Watcher:
         # Human-facing watcher logs use Taiwan time; state fields retain UTC.
         line = f"{taipei_now()} {message}"
         print(line, flush=True)
-        with self.log_path.open("a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        append_rotating_text(
+            self.log_path,
+            line + "\n",
+            max_bytes=self.config.get("log_max_bytes", 5 * 1024 * 1024),
+            backup_count=self.config.get("log_backup_count", 3),
+        )
 
     def save_state(self):
         payload = {
@@ -317,7 +341,7 @@ class Watcher:
                 self.base_dir / output_root
             ).resolve()
 
-        return [
+        command = [
             sys.executable,
             str(collector_script),
             username,
@@ -325,7 +349,14 @@ class Watcher:
             str(output_root),
             "--offline-confirmations",
             str(self.config.get("offline_confirmations", 3)),
+            "--log-max-bytes",
+            str(self.config.get("log_max_bytes", 5 * 1024 * 1024)),
+            "--log-backups",
+            str(self.config.get("log_backup_count", 3)),
         ]
+        if self.config.get("capture_raw_events"):
+            command.append("--capture-raw")
+        return command
 
     def start_collector(self, username, room_id=None):
         if paused(self.quota_pause_until_utc):
@@ -362,6 +393,8 @@ class Watcher:
         )
 
     def should_start_probe_error_fallback(self, username, error):
+        if self.probe_only:
+            return False
         if not self.config.get("start_collector_on_probe_error", True):
             return False
         text = str(error or "").lower()
@@ -529,8 +562,8 @@ class Watcher:
             else:
                 self.log(f"[AGGREGATE] @{username} no timestamped events; summary written, plots skipped")
         try:
-            write_health_report(target)
-        except OSError as exc:
+            _write_health_report(target)
+        except (ImportError, OSError) as exc:
             self.log(f"[HEALTH] @{username} report failed: {exc}")
         self.log(f"[AGGREGATE] @{username} daily={target.name} sources refreshed")
 
@@ -542,7 +575,7 @@ class Watcher:
             if source is None:
                 continue
             try:
-                report = write_health_report(source)
+                report = _write_health_report(source)
                 stalled = bool(report.get("event_stalled"))
                 if stalled and username not in self.stalled_collectors:
                     self.stalled_collectors.add(username)
@@ -551,7 +584,7 @@ class Watcher:
                 elif not stalled and username in self.stalled_collectors:
                     self.stalled_collectors.discard(username)
                     self.log(f"[RECOVER] @{username} event flow resumed")
-            except OSError as exc:
+            except (ImportError, OSError) as exc:
                 self.log(f"[HEALTH] @{username} report failed: {exc}")
 
     def latest_source(self, username):
@@ -644,6 +677,14 @@ class Watcher:
                         f"{previous_room} -> {result['room_id']}"
                     )
 
+            if self.probe_only:
+                state["status"] = "live_confirmed"
+                self.log(
+                    f"[LIVE] @{username} room={result['room_id'] or 'unknown'} "
+                    "(probe only; Collector not started)"
+                )
+                return
+
             process = self.processes.get(username)
             if process is None or process.poll() is not None:
                 self.start_collector(
@@ -657,7 +698,7 @@ class Watcher:
             )
             return
 
-        # No LIVE confirmation. This may be actual offline, timeout, TikTools
+        # No LIVE confirmation. This may be actual offline, timeout, TikTokLive
         # failure, or network failure. Require several consecutive misses.
         state["consecutive_misses"] += 1
 
@@ -667,6 +708,17 @@ class Watcher:
             f"{self.config['offline_confirmations']} "
             f"error={result['error'] or 'none'}"
         )
+
+        if self.probe_only:
+            if "is not currently live" in str(result["error"] or "").casefold() and (
+                state["consecutive_misses"] >= self.config["offline_confirmations"]
+            ):
+                state["status"] = "not_live"
+            elif result["error"]:
+                state["status"] = "probe_error"
+            else:
+                state["status"] = "waiting"
+            return
 
         process = self.processes.get(username)
         if process is not None and process.poll() is None:
@@ -710,7 +762,7 @@ class Watcher:
         self.acquire_pid()
         self.stop_path.unlink(missing_ok=True)
         self.log(
-            "[WATCHER] started | "
+            f"[WATCHER] started{' (probe only)' if self.probe_only else ''} | "
             + (", ".join(
                 f"@{s['username']}" for s in enabled
             ) if enabled else "no enabled streamers")
@@ -782,16 +834,21 @@ class Watcher:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Watch TikTok IDs and auto-start LIVE collection."
+        description="Probe TikTok LIVE status and optionally auto-start collection."
     )
     parser.add_argument(
         "--config",
         default="watchlist.json",
         help="Watcher JSON config (default: watchlist.json)",
     )
+    parser.add_argument(
+        "--probe-only",
+        action="store_true",
+        help="Only update LIVE probe status; never start a Collector.",
+    )
     args = parser.parse_args()
 
-    Watcher(args.config).run()
+    Watcher(args.config, probe_only=args.probe_only).run()
 
 
 if __name__ == "__main__":

@@ -168,12 +168,48 @@ def analyze_session(
     disconnected_events = sum(
         row.get("system_event") == "disconnected" for row in by_type.get("system", [])
     )
+    latest_system_event = next(
+        (row for row in reversed(rows) if row.get("type") == "system"),
+        None,
+    )
+    latest_system_name = (latest_system_event or {}).get("system_event")
     first_room_id = next(
         (row.get("room_id") for row in rows if row.get("room_id") not in (None, "")),
         None,
     )
     first_received = min(all_times) if all_times else None
     last_received = max(all_times) if all_times else None
+    latest_event_utc = (
+        datetime.fromtimestamp(last_received / 1000, tz=timezone.utc).isoformat()
+        if last_received is not None else None
+    )
+    latest_connection_signal_ms = (
+        _received_ms(latest_system_event) if latest_system_event else None
+    )
+    latest_connection_signal_utc = (
+        datetime.fromtimestamp(latest_connection_signal_ms / 1000, tz=timezone.utc).isoformat()
+        if latest_connection_signal_ms is not None else None
+    )
+    last_event_age_seconds = (
+        max(0.0, (datetime.now(timezone.utc).timestamp() * 1000 - last_received) / 1000)
+        if last_received is not None else None
+    )
+    if summary.get("status") == "error":
+        connection_state = "error"
+    elif summary.get("ended_at_utc"):
+        connection_state = "session_ended"
+    elif summary.get("live_ended"):
+        connection_state = "not_live"
+    elif latest_system_name == "live_end":
+        connection_state = "not_live"
+    elif last_event_age_seconds is not None and last_event_age_seconds > 90:
+        connection_state = "stale"
+    elif latest_system_name == "connected":
+        connection_state = "connected"
+    elif latest_system_name == "disconnected":
+        connection_state = "reconnecting"
+    else:
+        connection_state = "unknown"
     inferred_start = (
         datetime.fromtimestamp(first_received / 1000, tz=timezone.utc).isoformat()
         if first_received is not None else None
@@ -216,6 +252,10 @@ def analyze_session(
         "socket_uptime_ratio": uptime,
         "connection_count": summary.get("connection_count") or connected_events,
         "disconnect_count": summary.get("disconnect_count") or disconnected_events,
+        "connection_state": connection_state,
+        "last_connection_signal_utc": latest_connection_signal_utc,
+        "last_event_at_utc": latest_event_utc,
+        "last_event_age_seconds": round(last_event_age_seconds, 1) if last_event_age_seconds is not None else None,
         "event_counts": dict(sorted(counts.items())),
         "event_interval_seconds": {
             "median": round(median(event_intervals), 3) if event_intervals else None,

@@ -41,6 +41,14 @@ def event_time_ms(event):
     return value if isinstance(value, (int, float)) else None
 
 
+def event_local_time(event):
+    value = event.get("timestamp_local") or event.get("received_at_local")
+    if value:
+        return value
+    value = event.get("timestamp_utc") or event.get("received_at_utc")
+    return value or iso_local(event_time_ms(event))
+
+
 def iso_local(timestamp_ms):
     if timestamp_ms is None:
         return None
@@ -105,7 +113,7 @@ def audience_metrics(session_dir: Path):
 
 
 def session_summary(session_dir: Path):
-    meta = read_json(session_dir / "session.json", {}) or {}
+    meta = read_json(session_dir / "session.json", {}) or read_json(session_dir / "summary.json", {}) or {}
     events = list(iter_events(session_dir) or [])
     timestamps = [value for event in events if (value := event_time_ms(event)) is not None]
     viewers = [event.get("viewer_count") for event in events if event.get("type") == "viewer" and isinstance(event.get("viewer_count"), (int, float))]
@@ -113,7 +121,7 @@ def session_summary(session_dir: Path):
     gifts = [event for event in events if event.get("type") == "gift" and event.get("counted")]
     likes = [event for event in events if event.get("type") == "like"]
     members = [event for event in events if event.get("type") == "member"]
-    social = [event for event in events if event.get("type") == "social"]
+    social = [event for event in events if event.get("type") in {"social", "follow", "share"}]
     subscribes = [event for event in events if event.get("type") == "subscribe"]
     start = min(timestamps) if timestamps else None
     end = max(timestamps) if timestamps else None
@@ -123,7 +131,10 @@ def session_summary(session_dir: Path):
     likes_current_total = max(like_totals) if like_totals else None
     likes_first_total = like_totals[0] if like_totals else None
     likes_baseline_estimate = max(0, likes_first_total - int(likes[0].get("like_count") or 0)) if like_totals else None
-    actions = Counter(str(event.get("social_action") or "unknown") for event in social)
+    actions = Counter(
+        str(event.get("social_action") or (event.get("type") if event.get("type") != "social" else "unknown"))
+        for event in social
+    )
     return {
         "session_id": str(meta.get("session_id") or session_dir.name),
         "session_dir": str(session_dir),
@@ -174,7 +185,7 @@ def gift_leaderboard(session_dirs: list[Path]):
             repeat_count = int(event.get("repeat_count") or 1)
             rows.append({
                 "session_id": session_id,
-                "time": event.get("timestamp_local") or event.get("received_at_local"),
+                "time": event_local_time(event),
                 "gifter": user_id(event),
                 "gift_name": event.get("gift_name") or "unknown",
                 "gift_id": event.get("gift_id"),
@@ -212,7 +223,7 @@ def gift_detail(session_dirs: list[Path]):
             if event.get("type") == "gift" and event.get("counted"):
                 rows.append({
                     "session_id": session_dir.name,
-                    "time": event.get("timestamp_local") or event.get("received_at_local"),
+                    "time": event_local_time(event),
                     "gifter": user_id(event),
                     "gift_name": event.get("gift_name") or "unknown",
                     "items": int(event.get("repeat_count") or 1),
@@ -315,7 +326,7 @@ def traffic_sources(session_dirs: list[Path]):
             if event.get("type") == "member":
                 rows.append({
                     "session_id": session_dir.name,
-                    "time": event.get("timestamp_local") or event.get("received_at_local"),
+                    "time": event_local_time(event),
                     "user": user_id(event),
                     "entry_source": event.get("entry_source") or "unknown",
                     "entry_action": event.get("entry_action") or "unknown",
@@ -329,15 +340,15 @@ def social_summary(session_dirs: list[Path]):
     for session_dir in session_dirs:
         for event in iter_events(session_dir) or []:
             event_type = event.get("type")
-            if event_type == "social":
-                action = event.get("social_action") or "unknown"
+            if event_type in {"social", "follow", "share"}:
+                action = event.get("social_action") or (event_type if event_type != "social" else "unknown")
             elif event_type == "subscribe":
                 action = "subscribe"
             else:
                 continue
             rows.append({
                 "session_id": session_dir.name,
-                "time": event.get("timestamp_local") or event.get("received_at_local"),
+                "time": event_local_time(event),
                 "action": action,
                 "user": user_id(event),
             })
@@ -358,8 +369,8 @@ def social_activity_by_minute(session_dirs: list[Path]):
                 "follows": 0, "shares": 0, "subscribes": 0,
                 "joins": 0, "viewer_count": None,
             }
-            if event_type == "social":
-                action = str(event.get("social_action") or "unknown")
+            if event_type in {"social", "follow", "share"}:
+                action = str(event.get("social_action") or (event_type if event_type != "social" else "unknown"))
                 if action == "follow":
                     row["follows"] = 1
                 elif action == "share":
@@ -398,8 +409,9 @@ def social_conversion_proxies(session_dirs: list[Path]):
         joins = sum(event.get("type") == "member" for event in events)
         actions = {"follow": [], "share": [], "subscribe": []}
         for event in events:
-            if event.get("type") == "social":
-                action = str(event.get("social_action") or "unknown")
+            if event.get("type") in {"social", "follow", "share"}:
+                event_type = event.get("type")
+                action = str(event.get("social_action") or (event_type if event_type != "social" else "unknown"))
             elif event.get("type") == "subscribe":
                 action = "subscribe"
             else:
@@ -531,7 +543,7 @@ def _connected_coverage(meta, checked_at):
 
 
 def build_health_report(session_dir: Path, *, checked_at=None, stale_after_seconds=300):
-    meta = read_json(session_dir / "session.json", {}) or {}
+    meta = read_json(session_dir / "session.json", {}) or read_json(session_dir / "summary.json", {}) or {}
     checked_at = checked_at or datetime.now(TAIPEI_TZ)
     window, connected, coverage = _connected_coverage(meta, checked_at)
     running = meta.get('status') in ('running', 'collecting')

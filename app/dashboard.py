@@ -5,8 +5,8 @@ import os
 import subprocess
 import sys
 import time
-import importlib.util
 from collections import Counter, defaultdict, deque
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -118,19 +118,60 @@ def watcher_pid() -> int | None:
         return None
 
 
+@lru_cache(maxsize=1)
+def watcher_python() -> Path | None:
+    """Find an installed runtime for the TikTokLive-backed status probe."""
+    venv_python = (
+        ROOT / ".venv_tiktoklive" / "Scripts" / "python.exe"
+        if os.name == "nt"
+        else ROOT / ".venv_tiktoklive" / "bin" / "python"
+    )
+    candidates = [venv_python, Path(sys.executable)]
+    checked = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if resolved in checked or not resolved.is_file():
+            continue
+        checked.add(resolved)
+        try:
+            result = subprocess.run(
+                [str(resolved), "-c", "import TikTokLive"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if result.returncode == 0:
+            return resolved
+    return None
+
+
 def start_watcher() -> str:
     pid = watcher_pid()
     if pid_is_running(pid):
         return tr(f"Watcher already running (PID {pid}).", f"Watcher 已在執行中（PID {pid}）。")
 
+    python = watcher_python()
+    if python is None:
+        return tr(
+            "Watcher needs a Python environment with TikTokLive installed.",
+            "Watcher 需要安裝 TikTokLive 的 Python 環境。",
+        )
+
     WATCHER_PID.parent.mkdir(parents=True, exist_ok=True)
     WATCHER_PID.unlink(missing_ok=True)
     process = subprocess.Popen(
         [
-            sys.executable,
+            str(python),
             str(ROOT / "src" / "watcher.py"),
             "--config",
             str(CONFIG_PATH),
+            "--probe-only",
         ],
         cwd=str(ROOT),
         stdin=subprocess.DEVNULL,
@@ -181,6 +222,12 @@ def session_dirs(username: str | None = None) -> list[Path]:
     return sorted(result, key=lambda item: item.name, reverse=True)
 
 
+def session_metadata(path: Path) -> dict:
+    """Read metadata from either a Collector or Provider Benchmark session."""
+    metadata = read_json(path / "session.json", {})
+    return metadata or read_json(path / "summary.json", {})
+
+
 def benchmark_session_dirs() -> list[Path]:
     """Return provider benchmark sessions that have recorded events."""
     if not BENCHMARK_ROOT.exists():
@@ -202,42 +249,104 @@ def benchmark_session_dirs() -> list[Path]:
     return sorted(result, key=lambda item: item.stat().st_mtime, reverse=True)
 
 
+def active_benchmark_session_dirs() -> list[Path]:
+    """Return benchmark captures that still appear to be collecting."""
+    active = []
+    for path in benchmark_session_dirs():
+        metadata = session_metadata(path)
+        status = str(metadata.get("status") or "").casefold()
+        if status in {"running", "collecting", "connecting"}:
+            active.append(path)
+            continue
+        if metadata.get("ended_at_utc") or metadata.get("live_ended") or status in {
+            "stopped", "ended", "error", "failed"
+        }:
+            continue
+        # An in-flight benchmark may not write summary.json until shutdown.
+        try:
+            if time.time() - (path / "events.ndjson").stat().st_mtime <= 120:
+                active.append(path)
+        except OSError:
+            continue
+    return active
+
+
+_SESSION_ANALYTICS_CACHE: dict[str, tuple[int, int, bool]] = {}
+
+
 def session_has_analytics(path: Path) -> bool:
-    """Return quickly once a timestamped non-system event is found."""
+    """Use compact metadata first; scan legacy NDJSON at most once per file version."""
+    metadata = session_metadata(path)
+    live_state = read_json(path / "live_state.json", {})
+    event_counts = {}
+    for counts in (metadata.get("event_counts"), live_state.get("event_counts")):
+        if isinstance(counts, dict):
+            event_counts.update(counts)
+    if event_counts:
+        return any(
+            event_type not in {None, "system", "room", "control"}
+            and int(count or 0) > 0
+            for event_type, count in event_counts.items()
+        )
+    if metadata.get("status") == "running":
+        return True
+
     events_path = path / "events.ndjson"
     try:
+        stat = events_path.stat()
+        cache_key = str(events_path.resolve())
+        cached = _SESSION_ANALYTICS_CACHE.get(cache_key)
+        if cached and cached[:2] == (stat.st_size, stat.st_mtime_ns):
+            return cached[2]
         with events_path.open("r", encoding="utf-8", errors="replace") as rows:
             for line in rows:
                 try:
                     event = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if event.get("type") not in {None, "system"} and isinstance(event.get("timestamp_ms"), (int, float)):
+                if event.get("type") not in {None, "system", "room", "control"} and isinstance(event.get("timestamp_ms"), (int, float)):
+                    _SESSION_ANALYTICS_CACHE[cache_key] = (
+                        stat.st_size,
+                        stat.st_mtime_ns,
+                        True,
+                    )
                     return True
     except OSError:
         return False
+    _SESSION_ANALYTICS_CACHE[cache_key] = (
+        stat.st_size,
+        stat.st_mtime_ns,
+        False,
+    )
+    if len(_SESSION_ANALYTICS_CACHE) > 512:
+        _SESSION_ANALYTICS_CACHE.pop(next(iter(_SESSION_ANALYTICS_CACHE)))
     return False
 
 
 def session_label(path: Path) -> str:
-    meta = read_json(path / "session.json", {})
+    meta = session_metadata(path)
     status = str(meta.get("status") or "unknown")
     kind = "analytics" if session_has_analytics(path) else "system only"
     return f"{path.name}  |  {status}  |  {kind}"
 
 
 def resolve_session(manual_id: str, username: str, selected_id: str) -> Path | None:
+    candidates = session_dirs(username) + [
+        path for path in benchmark_session_dirs()
+        if str(session_metadata(path).get("username") or "").lstrip("@") == username
+    ]
+    candidates.sort(key=lambda item: item.stat().st_mtime if item.exists() else 0, reverse=True)
     manual_id = manual_id.strip()
     if manual_id:
-        candidate = RAW_ROOT / manual_id
-        if candidate.is_dir() and (candidate / "session.json").exists():
-            return candidate
+        for candidate in candidates:
+            if candidate.name == manual_id:
+                return candidate
 
         # Also accept a TikTok room_id and resolve it to the newest matching
         # captured session for the selected streamer.
         matches = []
-        for path in session_dirs(username):
-            meta = read_json(path / "session.json", {})
+        for path in candidates:
+            meta = session_metadata(path)
             source_ids = [str(value) for value in meta.get("source_session_ids") or []]
             if (
                 str(meta.get("room_id") or "") == manual_id
@@ -248,11 +357,10 @@ def resolve_session(manual_id: str, username: str, selected_id: str) -> Path | N
         return matches[0] if matches else None
 
     if selected_id:
-        candidate = RAW_ROOT / selected_id
-        if candidate.is_dir():
-            return candidate
+        for candidate in candidates:
+            if candidate.name == selected_id:
+                return candidate
 
-    candidates = session_dirs(username)
     return candidates[0] if candidates else None
 
 
@@ -281,7 +389,7 @@ def load_session(session_dir: Path | None):
     if session_dir is None:
         return summary
 
-    summary["session"] = read_json(session_dir / "session.json", {})
+    summary["session"] = session_metadata(session_dir)
     events_path = session_dir / "events.ndjson"
     try:
         lines = events_path.open("r", encoding="utf-8")
@@ -303,8 +411,11 @@ def load_session(session_dir: Path | None):
                 or event.get("timestamp_utc")
                 or event.get("received_at_utc")
             )
+            event_time_ms = event.get("timestamp_ms") or event.get("received_at_ms")
+            if not event_time and isinstance(event_time_ms, (int, float)):
+                event_time = pd.Timestamp(event_time_ms, unit="ms", tz="UTC").tz_convert(TAIPEI_TZ).isoformat()
 
-            if event_type == "viewer":
+            if event_type in {"viewer", "roomUserSeq"}:
                 value = event.get("viewer_count")
                 if isinstance(value, (int, float)) and event_time:
                     summary["viewers"].append(value)
@@ -337,8 +448,8 @@ def load_session(session_dir: Path | None):
                 })
             elif event_type == "member":
                 summary["joins"] += 1
-            elif event_type == "social":
-                action = event.get("social_action")
+            elif event_type in {"social", "follow", "share"}:
+                action = event.get("social_action") or (event_type if event_type != "social" else None)
                 if action == "follow":
                     summary["follows"] += 1
                 elif action == "share":
@@ -890,6 +1001,95 @@ def latest_live_session(username: str | None) -> Path | None:
     return max(candidates, key=lambda item: item[0])[1] if candidates else None
 
 
+def render_current_connection_status(username: str, watcher_state: dict) -> None:
+    """Show current probe and Collector state without treating history as live state."""
+    last_probe = pd.to_datetime(
+        watcher_state.get("last_probe_at_utc"), utc=True, errors="coerce"
+    )
+    last_confirmed = pd.to_datetime(
+        watcher_state.get("last_confirmed_live_at_utc"), utc=True, errors="coerce"
+    )
+    error = str(watcher_state.get("last_probe_error") or "")
+    config = read_json(CONFIG_PATH, {})
+    poll_seconds = config.get("poll_seconds", 60)
+    try:
+        stale_after = max(180, float(poll_seconds) * 3)
+    except (TypeError, ValueError):
+        stale_after = 180
+    try:
+        offline_confirmations = max(1, int(config.get("offline_confirmations", 3)))
+    except (TypeError, ValueError):
+        offline_confirmations = 3
+
+    if pd.isna(last_probe):
+        probe_label = tr("No probe yet", "尚無探測紀錄")
+    elif (pd.Timestamp.now(tz="UTC") - last_probe).total_seconds() > stale_after:
+        probe_label = tr("Probe stale", "探測逾時")
+    elif "is not currently live" in error.casefold():
+        misses = int(watcher_state.get("consecutive_misses") or 0)
+        probe_label = (
+            tr("Not LIVE", "未開播")
+            if misses >= offline_confirmations
+            else tr(
+                f"Confirming not LIVE ({misses}/{offline_confirmations})",
+                f"確認未開播中（{misses}/{offline_confirmations}）",
+            )
+        )
+    elif error:
+        probe_label = tr("Probe error", "探測錯誤")
+    elif pd.notna(last_confirmed) and last_confirmed == last_probe:
+        probe_label = tr("LIVE confirmed", "已確認直播中")
+    else:
+        probe_label = tr("Waiting for LIVE result", "等待開播探測結果")
+
+    collector = latest_live_session(username)
+    if collector:
+        live_state = read_json(collector / "live_state.json", {})
+        socket_state = str(live_state.get("connection_state") or "starting")
+        if socket_state == "disconnected" and live_state.get("current_gap_started_at_ms") is not None:
+            socket_state = "reconnecting"
+        socket_labels = {
+            "connected": tr("Connected", "WebSocket 已連線"),
+            "disconnected": tr("Disconnected", "WebSocket 已中斷"),
+            "reconnecting": tr("Reconnecting", "重連中"),
+            "offline": tr("Not LIVE", "未開播"),
+            "not_live": tr("Not LIVE", "未開播"),
+            "starting": tr("Connecting", "連線中"),
+            "session_ended": tr("Session ended", "場次已結束"),
+            "error": tr("Error", "錯誤"),
+            "unknown": tr("Waiting for signal", "等待連線訊號"),
+        }
+        collector_label = socket_labels.get(socket_state, socket_state)
+    else:
+        active_benchmark = next(
+            (
+                path for path in active_benchmark_session_dirs()
+                if str(session_metadata(path).get("username") or "").lstrip("@") == username
+            ),
+            None,
+        )
+        collector_label = (
+            tr("Active capture; see Live Sessions", "場次收集中；請到 Live Sessions 查看連線訊號")
+            if active_benchmark else tr("Not connected", "Collector 未連線")
+        )
+
+    probe_col, collector_col = st.columns(2)
+    probe_col.metric(tr("Current LIVE probe", "目前開播探測"), probe_label)
+    collector_col.metric(tr("Collector WebSocket", "Collector WebSocket"), collector_label)
+    if pd.notna(last_probe):
+        checked_label = last_probe.tz_convert(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        st.caption(f"{tr('Last probe (Taiwan time)', '最近探測（台灣時間）')}：{checked_label}")
+    elif not watcher_state:
+        st.caption(
+            tr(
+                "The Watcher has no probe record yet. Start the Watcher to check whether this account is LIVE now.",
+                "Watcher 尚無探測紀錄。啟動 Watcher 後，才能確認帳號目前是否開播。",
+            )
+        )
+    if error and "is not currently live" not in error.casefold():
+        st.caption(f"{tr('Probe detail', '探測訊息')}：{error[:160]}")
+
+
 def render_live_tracking(session_dir: Path | None, metrics: dict, streamer_state: dict):
     if session_dir is None:
         st.info(tr("No active tracking session.", "目前沒有進行中的追蹤場次。"))
@@ -914,23 +1114,26 @@ def render_live_tracking(session_dir: Path | None, metrics: dict, streamer_state
         st.info(tr("Waiting for live events...", "等待即時事件..."))
 
 def render_provider_benchmark():
-    from src.provider_benchmark_report import analyze_session
+    import src.provider_benchmark_report as benchmark_report_module
 
-    st.title(tr("Provider Benchmark", "Provider Benchmark 測試"))
+    benchmark_report_module = importlib.reload(benchmark_report_module)
+    analyze_session = benchmark_report_module.analyze_session
+
+    st.title(tr("Live Sessions", "直播場次"))
     st.caption(
         tr(
-            "Read-only view of active and completed isolated provider sessions. This page does not start a Watcher or another LIVE connection.",
-            "唯讀查看進行中或已完成的 Provider session。本頁不會啟動 Watcher，也不會建立額外的 LIVE 連線。",
+            "Read-only session dashboard for active and completed LIVE captures. It refreshes every five seconds; the Collector WebSocket state comes from its latest connection signal, separately from the Watcher LIVE probe.",
+            "唯讀查看進行中或已完成的直播場次，每五秒更新一次。Collector WebSocket 狀態依最後連線訊號顯示，與 Watcher 的 LIVE 探測分開。",
         )
     )
     paths = benchmark_session_dirs()
     if not paths:
-        st.info(tr("No provider benchmark session with recorded events was found.", "找不到含有事件紀錄的 Provider session。"))
+        st.info(tr("No LIVE session with recorded events was found.", "找不到含有事件紀錄的直播場次。"))
         return
 
     labels = [f"{path.parent.name} · {path.name}" for path in paths]
     selected_label = st.selectbox(
-        tr("Benchmark session", "Benchmark 場次"),
+        tr("LIVE session", "直播場次"),
         options=labels,
         key="provider_benchmark_session",
     )
@@ -946,14 +1149,52 @@ def render_provider_benchmark():
         f"{(report.get('package_versions') or {}).get('TikTokLive') or ''} · "
         f"{report['duration_seconds'] / 60:.1f} {tr('minutes elapsed', '分鐘')}"
     )
-    metric_cols = st.columns(5)
-    metric_cols[0].metric(tr("Viewer samples", "觀眾採樣"), report["viewer_sample_count"])
-    metric_cols[1].metric(tr("Chat messages", "聊天訊息"), report["event_counts"].get("chat", 0))
-    metric_cols[2].metric(tr("Gift events", "禮物事件"), report["gift_count"])
-    metric_cols[3].metric(tr("Diamonds observed", "紀錄到的 Diamonds"), report["gift_diamonds_observed"])
-    metric_cols[4].metric(
+    connection_labels = {
+        "connected": tr("LIVE", "直播中"),
+        "not_live": tr("Not LIVE", "未開播"),
+        "reconnecting": tr("Reconnecting", "重連中"),
+        "disconnected": tr("Disconnected", "已中斷"),
+        "live_ended": tr("LIVE ended", "直播已結束"),
+        "session_ended": tr("Session ended", "場次已結束"),
+        "error": tr("Error", "錯誤"),
+        "stale": tr("Signal stale", "狀態訊號逾時"),
+        "unknown": tr("Waiting for signal", "等待連線訊號"),
+    }
+    metric_cols = st.columns(6)
+    metric_cols[0].metric(
+        tr("Collector WebSocket", "Collector WebSocket"),
+        connection_labels.get(report.get("connection_state"), tr("Unknown", "未知")),
+        help=tr(
+            "LIVE means the selected Collector last recorded a connected socket. Not LIVE requires an explicit LIVE end event. Other states describe reconnects, stale signals, or errors; this is separate from the Watcher probe.",
+            "直播中表示所選 Collector 最後記錄到 WebSocket 已連線；未開播須有明確的直播結束事件。其他狀態表示重連、訊號逾時或錯誤；這與 Watcher 探測分開。",
+        ),
+    )
+    metric_cols[1].metric(tr("Viewer samples", "觀眾採樣"), report["viewer_sample_count"])
+    metric_cols[2].metric(tr("Chat messages", "聊天訊息"), report["event_counts"].get("chat", 0))
+    metric_cols[3].metric(tr("Gift events", "禮物事件"), report["gift_count"])
+    metric_cols[4].metric(tr("Diamonds observed", "紀錄到的 Diamonds"), report["gift_diamonds_observed"])
+    metric_cols[5].metric(
         tr("Connections / disconnects", "連線／中斷"),
         f"{report.get('connection_count') or 0} / {report.get('disconnect_count') or 0}",
+    )
+    latest_event = pd.to_datetime(report.get("last_event_at_utc"), utc=True, errors="coerce")
+    latest_signal = pd.to_datetime(report.get("last_connection_signal_utc"), utc=True, errors="coerce")
+    now_utc = pd.Timestamp.now(tz="UTC")
+    last_event_age = (
+        max(0.0, (now_utc - latest_event).total_seconds())
+        if pd.notna(latest_event) else None
+    )
+    signal_time = (
+        latest_signal.tz_convert(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        if pd.notna(latest_signal) else tr("not recorded", "尚無紀錄")
+    )
+    last_event_label = (
+        f"{last_event_age:.0f} s {tr('ago', '前')}"
+        if last_event_age is not None else tr("not recorded", "尚無紀錄")
+    )
+    st.caption(
+        f"{tr('Last WebSocket state signal (Taiwan time)', '最近 WebSocket 狀態訊號（台灣時間）')}：{signal_time} · "
+        f"{tr('Last captured event', '最近捕獲事件')}：{last_event_label}"
     )
 
     interval = report["viewer_interval_seconds"]
@@ -1309,6 +1550,324 @@ def render_provider_benchmark():
                         panel_renderers[panel_name]()
 
 
+def render_lightweight_live_view(session_dir: Path, streamer_state: dict) -> bool:
+    """Render the bounded live-state snapshot and report whether full history was requested."""
+    metadata = read_json(session_dir / "session.json", {})
+    live_state = read_json(session_dir / "live_state.json", {})
+    if not live_state:
+        st.warning(
+            tr(
+                "This collector session has no lightweight live state yet. Restart the collector to enable live-state updates, or request a full historical scan below.",
+                "這場 Collector 尚未產生輕量即時狀態。重新啟動 Collector 後即可更新；也可以在下方要求完整歷史掃描。",
+            )
+        )
+    else:
+        last_event_ms = live_state.get("last_event_at_ms")
+        if isinstance(last_event_ms, (int, float)):
+            last_event_age = max(
+                0.0,
+                (pd.Timestamp.now(tz="UTC").timestamp() * 1000 - last_event_ms) / 1000,
+            )
+            last_event_label = f"{last_event_age:.1f} s"
+        else:
+            last_event_label = tr("waiting", "等待中")
+
+        st.caption(
+            f"@{live_state.get('username') or metadata.get('username') or 'unknown'} | "
+            f"{tr('Session', '場次')} {session_dir.name} | "
+            f"{tr('Last event age', '最近事件經過')} {last_event_label}"
+        )
+        socket_state = str(live_state.get("connection_state") or "unknown")
+        session_status = str(metadata.get("status") or "")
+        if session_status == "error":
+            socket_state = "error"
+        elif session_status in {"offline_confirmed", "live_end"} or socket_state == "offline":
+            socket_state = "not_live"
+        elif session_status and session_status != "running":
+            socket_state = "session_ended"
+        elif socket_state == "disconnected" and live_state.get("current_gap_started_at_ms") is not None:
+            socket_state = "reconnecting"
+        socket_labels = {
+            "connected": tr("LIVE", "直播中"),
+            "not_live": tr("Not LIVE", "未開播"),
+            "reconnecting": tr("Reconnecting", "重連中"),
+            "disconnected": tr("Disconnected", "已中斷"),
+            "starting": tr("Connecting", "連線中"),
+            "session_ended": tr("Session ended", "場次已結束"),
+            "error": tr("Error", "錯誤"),
+            "unknown": tr("Waiting for signal", "等待連線訊號"),
+        }
+        watcher_task_labels = {
+            "collecting": tr("Collecting", "收集中"),
+            "connecting": tr("Connecting", "連線中"),
+            "live_confirmed": tr("LIVE confirmed (probe only)", "已確認直播（僅探測）"),
+            "not_live": tr("Not LIVE", "未開播"),
+            "probe_error": tr("Probe error", "探測錯誤"),
+            "restart_pending": tr("Restart pending", "等待重啟"),
+            "waiting": tr("Waiting for probe", "等待探測"),
+            "quota_paused": tr("Quota paused", "配額暫停"),
+        }
+        columns = st.columns(7)
+        columns[0].metric(
+            tr("Collector WebSocket", "Collector WebSocket"),
+            socket_labels.get(socket_state, tr("Error", "錯誤") if "error" in socket_state.casefold() else socket_state),
+            help=tr(
+                "Connection state reported by the long-running Collector socket.",
+                "長時間運作的 Collector WebSocket 回報的連線狀態。",
+            ),
+        )
+        watcher_task = str(streamer_state.get("status") or "unknown")
+        columns[1].metric(
+            tr("Watcher task", "Watcher 工作狀態"),
+            watcher_task_labels.get(watcher_task, watcher_task),
+        )
+        viewer_count = live_state.get("viewer_count")
+        columns[2].metric(
+            tr("Current viewers", "目前觀眾數"),
+            viewer_count if viewer_count is not None else "N/A",
+        )
+        columns[3].metric(tr("Likes", "按讚"), live_state.get("likes_total") or 0)
+        columns[4].metric(tr("Diamonds", "鑽石數"), int(live_state.get("diamonds") or 0))
+        columns[5].metric(tr("Chat", "聊天"), live_state.get("chat_count", 0))
+        columns[6].metric(tr("Gifts", "禮物"), live_state.get("gift_count", 0))
+
+        last_probe = pd.to_datetime(
+            streamer_state.get("last_probe_at_utc"), utc=True, errors="coerce"
+        )
+        last_confirmed_live = pd.to_datetime(
+            streamer_state.get("last_confirmed_live_at_utc"), utc=True, errors="coerce"
+        )
+        probe_error_text = str(streamer_state.get("last_probe_error") or "")
+        probe_age = (
+            max(0.0, (pd.Timestamp.now(tz="UTC") - last_probe).total_seconds())
+            if pd.notna(last_probe) else None
+        )
+        watcher_config = read_json(CONFIG_PATH, {})
+        configured_poll_seconds = watcher_config.get("poll_seconds", 60)
+        try:
+            offline_confirmations = max(1, int(watcher_config.get("offline_confirmations", 3)))
+        except (TypeError, ValueError):
+            offline_confirmations = 3
+        try:
+            probe_stale_after = max(180, float(configured_poll_seconds) * 3)
+        except (TypeError, ValueError):
+            probe_stale_after = 180
+        if probe_age is not None and probe_age > probe_stale_after:
+            probe_result = tr("Probe stale", "探測逾時")
+            probe_error = ""
+        elif "is not currently live" in probe_error_text.casefold():
+            misses = int(streamer_state.get("consecutive_misses") or 0)
+            probe_result = (
+                tr("Not LIVE", "未開播")
+                if misses >= offline_confirmations
+                else tr(
+                    f"Confirming not LIVE ({misses}/{offline_confirmations})",
+                    f"確認未開播中（{misses}/{offline_confirmations}）",
+                )
+            )
+            probe_error = ""
+        elif probe_error_text:
+            probe_result = tr("probe error", "探測錯誤")
+            probe_error = probe_error_text[:160]
+        elif pd.notna(last_probe) and pd.notna(last_confirmed_live) and last_probe == last_confirmed_live:
+            probe_result = tr("LIVE confirmed", "已確認開播")
+            probe_error = ""
+        elif pd.notna(last_probe):
+            probe_result = tr("LIVE not confirmed", "尚未確認開播")
+            probe_error = ""
+        else:
+            probe_result = tr("no probe yet", "尚無探測紀錄")
+            probe_error = ""
+        probe_time_label = (
+            last_probe.tz_convert(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S")
+            if pd.notna(last_probe) else tr("not recorded", "尚無紀錄")
+        )
+        confirmed_time_label = (
+            last_confirmed_live.tz_convert(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S")
+            if pd.notna(last_confirmed_live) else tr("not recorded", "尚無紀錄")
+        )
+        st.caption(
+            f"{tr('Watcher LIVE probe (TikTokLive WebSocket)', 'Watcher LIVE 探測（TikTokLive WebSocket）')}：{probe_result} · "
+            f"{tr('last check', '最近檢查')} {probe_time_label} · "
+            f"{tr('last confirmed LIVE', '最近確認開播')} {confirmed_time_label}"
+            + (f" · {probe_error}" if probe_error else "")
+        )
+
+        gap_started_at_ms = live_state.get("current_gap_started_at_ms")
+        current_gap = (
+            max(0.0, (pd.Timestamp.now(tz="UTC").timestamp() * 1000 - gap_started_at_ms) / 1000)
+            if isinstance(gap_started_at_ms, (int, float))
+            else None
+        )
+        connection_columns = st.columns(5)
+        connection_columns[0].metric(tr("Reconnects", "重新連線"), metadata.get("reconnect_count", 0))
+        connection_columns[1].metric(tr("Disconnects", "斷線"), metadata.get("disconnect_count", 0))
+        connection_columns[2].metric(tr("Connection gaps", "連線缺口"), live_state.get("gap_count", 0))
+        connection_columns[3].metric(
+            tr("Current gap", "目前缺口"),
+            f"{current_gap:.1f} s" if current_gap is not None else "—",
+        )
+        connection_columns[4].metric(
+            tr("Live-state write errors", "即時狀態寫入錯誤"),
+            metadata.get("live_state_write_errors", 0),
+        )
+        if live_state.get("last_gap_seconds") is not None:
+            st.caption(
+                f"{tr('Last completed connection gap', '最近一次連線缺口')}："
+                f"{live_state['last_gap_seconds']:.1f} s | "
+                f"{tr('Total observed gap time', '累計觀測缺口時間')}："
+                f"{live_state.get('total_gap_seconds', 0):.1f} s"
+            )
+
+        viewer_samples = live_state.get("viewer_samples") or []
+        if viewer_samples:
+            frame = pd.DataFrame(viewer_samples)
+            frame["time"] = pd.to_datetime(frame["received_at_ms"], unit="ms", utc=True).dt.tz_convert(TAIPEI_TZ)
+            chart = alt.Chart(frame).mark_line().encode(
+                x=alt.X("time:T", title=tr("Time", "時間")),
+                y=alt.Y("viewer_count:Q", title=tr("Viewers", "觀眾數")),
+                tooltip=["time:T", "viewer_count:Q"],
+            ).properties(height=220)
+            st.altair_chart(chart, use_container_width=True)
+
+        worker_state = read_json(DATA_ROOT / "tts" / "state.json", {})
+        if worker_state.get("active_session") == session_dir.name:
+            tts_metrics = worker_state.get("metrics") or {}
+            st.markdown(f"#### {tr('TTS health', 'TTS 健康狀態')}")
+            tts_columns = st.columns(5)
+            tts_columns[0].metric(tr("Worker", "Worker"), worker_state.get("status", "unknown"))
+            tts_columns[1].metric(tr("Queue depth", "佇列長度"), tts_metrics.get("queue_depth", 0))
+            tts_columns[2].metric(
+                tr("Oldest queue age", "最久等待"),
+                f"{(tts_metrics.get('oldest_queue_age_seconds') or 0):.1f} s",
+            )
+            tts_columns[3].metric(
+                tr("Playback p50", "播報 p50"),
+                f"{tts_metrics['p50_event_to_playback_ms']} ms" if tts_metrics.get("p50_event_to_playback_ms") is not None else "N/A",
+            )
+            tts_columns[4].metric(
+                tr("Playback p95", "播報 p95"),
+                f"{tts_metrics['p95_event_to_playback_ms']} ms" if tts_metrics.get("p95_event_to_playback_ms") is not None else "N/A",
+            )
+            if tts_metrics.get("skipped"):
+                st.json(tts_metrics["skipped"])
+
+        chat_column, gift_column = st.columns(2)
+        with chat_column:
+            if st.toggle(
+                tr("Show recent chat", "顯示最新聊天"),
+                value=True,
+                key=f"live_chat_visible_{session_dir.name}",
+            ):
+                st.dataframe(
+                    list(reversed(live_state.get("recent_chat") or [])),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+        with gift_column:
+            if st.toggle(
+                tr("Show recent gifts", "顯示最新禮物"),
+                value=True,
+                key=f"live_gifts_visible_{session_dir.name}",
+            ):
+                st.dataframe(
+                    list(reversed(live_state.get("recent_gifts") or [])),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+    return st.toggle(
+        tr("Load full historical charts and comparisons", "載入完整歷史圖表與比較"),
+        value=False,
+        key=f"full_history_{session_dir.name}",
+        help=tr(
+            "Historical analysis scans the complete NDJSON session files.",
+            "歷史分析會完整掃描這場直播的 NDJSON 檔案。",
+        ),
+    )
+
+
+def render_session_catalog() -> None:
+    """Show a bounded, unified index of Collector and Provider Benchmark sessions."""
+    raw_paths = session_dirs()
+    benchmark_paths = benchmark_session_dirs()
+    candidates = []
+
+    for path in raw_paths[:20]:
+        try:
+            modified_at = path.stat().st_mtime
+        except OSError:
+            modified_at = 0.0
+        candidates.append((path, "Collector", read_json(path / "session.json", {}), modified_at))
+
+    for path in benchmark_paths[:20]:
+        try:
+            modified_at = path.stat().st_mtime
+        except OSError:
+            modified_at = 0.0
+        metadata = read_json(path / "summary.json", {})
+        source_name = metadata.get("backend") or path.parent.name
+        candidates.append((path, f"LIVE session · {source_name}", metadata, modified_at))
+
+    candidates.sort(key=lambda item: item[3], reverse=True)
+    visible = candidates[:20]
+    st.subheader(tr("Recent sessions", "近期場次"))
+    if not visible:
+        st.info(tr("No recorded sessions yet.", "目前還沒有已記錄的場次。"))
+        return
+
+    rows = []
+    benchmark_options = {}
+    for path, source, metadata, _ in visible:
+        event_counts = metadata.get("event_counts") or {}
+        started = (
+            metadata.get("started_at_utc")
+            or metadata.get("started_at_local")
+            or metadata.get("created_at_utc")
+        )
+        started_at = pd.to_datetime(started, utc=True, errors="coerce")
+        if pd.notna(started_at):
+            started_label = started_at.tz_convert(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            started_label = path.name
+        username = metadata.get("username") or (path.name[16:] if len(path.name) > 16 else path.name)
+        status = metadata.get("status") or tr("in progress", "進行中")
+        rows.append({
+            tr("Session", "場次"): path.name,
+            tr("Streamer", "直播主"): f"@{username}",
+            tr("Source", "來源"): source,
+            tr("Status", "狀態"): status,
+            tr("Started (Taiwan time)", "開始時間（台灣）"): started_label,
+            tr("Chats", "聊天"): event_counts.get("chat", "—"),
+            tr("Gifts", "禮物"): event_counts.get("gift", "—"),
+            tr("Viewer samples", "觀眾採樣"): event_counts.get("viewer", "—"),
+        })
+        if source.startswith("LIVE session"):
+            benchmark_label = f"{path.parent.name} · {path.name}"
+            benchmark_options[benchmark_label] = path
+
+    st.caption(
+        tr(
+            f"Showing the {len(visible)} most recent of {len(raw_paths) + len(benchmark_paths)} sessions. This list reads session summaries only.",
+            f"顯示最近 {len(visible)} 場（共 {len(raw_paths) + len(benchmark_paths)} 場）；清單只讀場次摘要。",
+        )
+    )
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    if benchmark_options:
+        selected_label = st.selectbox(
+            tr("Open LIVE session", "開啟直播場次"),
+            options=list(benchmark_options),
+            key="dashboard_benchmark_session",
+        )
+        if st.button(
+            tr("View session details", "查看場次詳細資料"),
+            key="dashboard_open_benchmark_session",
+        ):
+            st.session_state["provider_benchmark_session"] = selected_label
+            st.switch_page(live_sessions_page)
+
+
 def render_dashboard():
     config = read_json(CONFIG_PATH, {"streamers": []})
     state = read_json(WATCHER_STATE, {"streamers": {}})
@@ -1344,18 +1903,28 @@ def render_dashboard():
         st.header(tr("Watch control", "監控控制"))
         pid = watcher_pid()
         running = pid_is_running(pid)
-        benchmark_collecting = bool(benchmark_session_dirs())
-        watcher_sdk_available = importlib.util.find_spec("tiktok_live_events") is not None
+        benchmark_collecting = bool(active_benchmark_session_dirs())
+        watcher_sdk_available = watcher_python() is not None
         st.write(f"Watcher：**{tr('RUNNING', '執行中') if running else tr('STOPPED', '已停止')}**")
         if pid:
             st.caption(f"PID: {pid}")
         if benchmark_collecting:
             st.caption(
-                tr("Provider Benchmark is collecting. Use its page; starting the legacy Watcher would open another TikTok connection.", "Provider Benchmark 正在收集。請使用該頁面；啟動舊版 Watcher 會建立另一條 TikTok 連線。")
+                tr("A LIVE session is collecting. Open Live Sessions to inspect it; starting the legacy Watcher would open another TikTok connection.", "直播場次正在收集中。請到「直播場次」檢視；啟動舊版 Watcher 會建立另一條 TikTok 連線。")
             )
         elif not watcher_sdk_available:
             st.caption(
-                tr("The legacy Watcher cannot start because tiktok_live_events is not installed in this Streamlit environment.", "舊版 Watcher 無法啟動：目前 Streamlit 環境未安裝 tiktok_live_events。")
+                tr(
+                    "Watcher is unavailable because no Python environment with TikTokLive was found.",
+                    "找不到已安裝 TikTokLive 的 Python 環境，Watcher 目前無法啟動。",
+                )
+            )
+        else:
+            st.caption(
+                tr(
+                    "Watcher checks LIVE status only; it will not start a Collector session.",
+                    "Watcher 只探測開播狀態，不會啟動 Collector 場次。",
+                )
             )
         if st.button(
             tr("Start watcher", "啟動 Watcher"),
@@ -1402,6 +1971,7 @@ def render_dashboard():
             format_func=lambda value: f"@{value}" if value else tr("No streamer", "沒有直播主"),
             key="analysis_username",
         )
+        tracking_dir = latest_live_session(username)
         manual_id = st.text_input(
             tr("Session ID or room ID (optional)", "Session ID 或直播間 ID（選填）"),
             placeholder="20260913_195928_chloe_o723_ or 7684970432562875157",
@@ -1409,15 +1979,25 @@ def render_dashboard():
             key="analysis_manual_id",
         )
         available = session_dirs(username) if username else []
+        if username:
+            available.extend(
+                path for path in benchmark_session_dirs()
+                if str(session_metadata(path).get("username") or "").lstrip("@") == username
+            )
+        available.sort(key=lambda path: path.stat().st_mtime if path.exists() else 0, reverse=True)
+        if tracking_dir and tracking_dir not in available:
+            available.insert(0, tracking_dir)
         analytics_sessions = [path for path in available if session_has_analytics(path)]
         if analytics_sessions:
             available = analytics_sessions
+            if tracking_dir and tracking_dir not in available:
+                available.insert(0, tracking_dir)
         available_ids = [path.name for path in available]
         labels = {path.name: session_label(path) for path in available}
         selected_id = st.selectbox(
             tr("Available sessions", "可用場次"),
             options=available_ids or [""],
-            index=0,
+            index=(available_ids.index(tracking_dir.name) if tracking_dir and tracking_dir.name in available_ids else 0),
             format_func=lambda value: labels.get(value, value or tr("No session", "沒有場次")),
             key="analysis_selected_id",
             disabled=bool(manual_id.strip()),
@@ -1431,34 +2011,46 @@ def render_dashboard():
         )
         if manual_id.strip():
             st.caption(tr("Manual Session ID overrides the dropdown.", "手動輸入的 Session ID 優先於下拉選單。"))
-        st.caption(f"{tr('Raw data', '原始資料')}：{RAW_ROOT}")
+        st.caption(f"{tr('Session data', '場次資料')}：{RAW_ROOT} · {BENCHMARK_ROOT}")
+
+    render_session_catalog()
 
     if not username:
         st.warning(tr("No enabled streamer configured.", "尚未設定已啟用的直播主。"))
         return
 
+    render_current_connection_status(username, states.get(username, {}))
     session_dir = resolve_session(manual_id, username, selected_id)
     if manual_id.strip() and session_dir is None:
         st.error(f"{tr('Session ID / room ID not found', '找不到 Session ID／直播間 ID')}：{manual_id.strip()}")
         return
+    lightweight_live = bool(
+        tracking_dir
+        and not manual_id.strip()
+        and session_dir == tracking_dir
+    )
+    if lightweight_live and not render_lightweight_live_view(
+        tracking_dir, states.get(username, {})
+    ):
+        return
+
     metrics = load_session(session_dir)
     session = metrics["session"] or {}
     streamer_state = states.get(username, {})
-    tracking_dir = latest_live_session(username)
-    tracking_room_id = (read_json(tracking_dir / "session.json", {}) or {}).get("room_id") if tracking_dir else None
+    tracking_room_id = (session_metadata(tracking_dir) or {}).get("room_id") if tracking_dir else None
     tracking_fragments = room_session_dirs(username, tracking_room_id) if tracking_dir else []
     tracking_metrics = combine_session_metrics(tracking_fragments, tracking_dir) if tracking_fragments else metrics
     selected_room_id = session.get("room_id")
     selected_fragments = room_session_dirs(username, selected_room_id)
     selected_room_metrics = combine_session_metrics(selected_fragments, session_dir) if selected_fragments else metrics
-    if tracking_dir and not manual_id.strip():
+    if tracking_dir and session_dir == tracking_dir and not manual_id.strip():
         display_metrics = tracking_metrics
     else:
         display_metrics = selected_room_metrics
     comparison_paths = [
-        RAW_ROOT / session_id
-        for session_id in comparison_ids
-        if session_id and (RAW_ROOT / session_id).is_dir()
+        path for session_id in comparison_ids
+        for path in available
+        if session_id and path.name == session_id
     ]
     if session_dir and session_dir not in comparison_paths:
         comparison_paths.insert(0, session_dir)
@@ -1477,7 +2069,7 @@ def render_dashboard():
         st.info(tr("No captured session is available for this streamer.", "此直播主目前沒有可用的收集紀錄。"))
         return
 
-    if tracking_dir:
+    if tracking_dir and session_dir == tracking_dir:
         st.success(f"{tr('LIVE collection active', '直播收集中')} - {tracking_dir.name}")
     elif metrics["viewer_rows"]:
         st.info(tr("Historical session analysis - no active LIVE collector for this streamer.", "歷史場次分析；此直播主目前沒有運作中的 LIVE Collector。"))
@@ -1641,7 +2233,7 @@ def render_reports_page():
         if item.get("username")
     ]
     from app.report_runtime import load_reports_ui
-    load_reports_ui().render_reports(RAW_ROOT, streamers)
+    load_reports_ui().render_reports([RAW_ROOT, BENCHMARK_ROOT], streamers)
 
 
 def render_chat_sender_page():
@@ -1651,14 +2243,16 @@ def render_chat_sender_page():
 
 render_language_selector()
 
+live_sessions_page = st.Page(
+    render_provider_benchmark_page,
+    title=tr("Live Sessions", "直播場次"),
+    url_path="sessions",
+)
+
 pages = {
     tr("Live", "直播"): [
         st.Page(render_dashboard_page, title=tr("Dashboard", "儀表板"), default=True),
-        st.Page(
-            render_provider_benchmark_page,
-            title=tr("Provider Benchmark", "Provider Benchmark 測試"),
-            url_path="provider-benchmark",
-        ),
+        live_sessions_page,
         st.Page(render_live_tts_page, title=tr("Live TTS", "直播語音"), url_path="live-tts"),
     ],
     tr("Tools", "工具"): [

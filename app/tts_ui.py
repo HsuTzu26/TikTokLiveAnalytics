@@ -403,11 +403,11 @@ def render_tts(streamers: list[str], watcher_states: dict) -> None:
             tr("Duplicate filter window (seconds)", "重複訊息過濾秒數"), min_value=0.0, max_value=600.0,
             value=float(settings.duplicate_window_seconds), step=1.0, disabled=running, key="tts_duplicate_window",
         )
-        max_queue_age = guard_cols[2].number_input(
-            tr("Maximum TTS queue age (seconds)", "TTS 佇列最長等待秒數"), min_value=0.0, max_value=300.0,
-            value=float(settings.max_queue_age_seconds), step=1.0, disabled=running,
-            help=tr("Older chat and gift announcements are skipped to keep TTS live. Set 0 to retain every queued event.", "超過等待上限的聊天與禮物會略過，以維持即時性。設為 0 則保留所有佇列事件。"),
-            key="tts_max_queue_age",
+        chat_ttl = guard_cols[2].number_input(
+            tr("Chat freshness limit (seconds)", "聊天新鮮度時限（秒）"), min_value=5.0, max_value=15.0,
+            value=float(settings.chat_ttl_seconds), step=1.0, disabled=running,
+            help=tr("Only queued Chat expires after this age. Captured Gifts stay queued until spoken or a backend failure is recorded.", "只有排隊中的聊天會在超過時限後過期；已捕獲禮物會保留至播出，或明確記錄語音服務失敗。"),
+            key="tts_chat_ttl",
         )
         ignore_emoji = guard_cols[3].checkbox(
             tr("Ignore emoji", "略過 Emoji"), value=settings.ignore_emoji, disabled=running, key="tts_ignore_emoji",
@@ -433,7 +433,7 @@ def render_tts(streamers: list[str], watcher_states: dict) -> None:
             "volume": int(volume),
             "max_text_length": int(max_length),
             "queue_size": int(queue_size),
-            "max_queue_age_seconds": float(max_queue_age),
+            "chat_ttl_seconds": float(chat_ttl),
             "user_cooldown_seconds": float(cooldown),
             "duplicate_window_seconds": float(duplicate_window),
             "min_request_interval_seconds": float(request_gap),
@@ -447,8 +447,8 @@ def render_tts(streamers: list[str], watcher_states: dict) -> None:
 
     st.caption(
         tr(
-            "Events stay in arrival order. Old queued messages are skipped after the selected age limit; set it to 0 for completeness over low latency. Chinese/English routing selects one voice for each whole message.",
-            "事件依到達順序播放。超過等待上限的訊息會略過；設為 0 可優先保留完整訊息，但延遲可能增加。每則訊息會選用中文或英文聲線。",
+            "Captured Chat and Gift announcements stay in timestamp order. Chat expires after the selected freshness limit; captured Gifts do not expire. Chinese/English routing selects one voice for each whole message.",
+            "已捕獲的聊天與禮物依事件時間排序；聊天超過新鮮度時限會過期，禮物不會因等待時間而丟棄。中英文訊息各自選擇一種聲線。",
         )
     )
 
@@ -486,17 +486,23 @@ def render_tts(streamers: list[str], watcher_states: dict) -> None:
         st.caption(f"{tr('Last worker stopped at', '上次 Worker 停止時間')} {state.get('stopped_at_local', 'unknown')}.")
 
     metrics = (state or {}).get("metrics", {}) if isinstance(state, dict) else {}
-    metric_cols = st.columns(5)
+    metric_cols = st.columns(7)
     metric_cols[0].metric(tr("Chats seen", "收到聊天"), metrics.get("chat_events_seen", 0))
     metric_cols[1].metric(tr("Spoken", "已朗讀"), metrics.get("spoken", 0))
     metric_cols[2].metric(tr("Queued", "佇列中"), f"{metrics.get('queue_depth', 0)} / {metrics.get('queue_capacity', settings.queue_size)}")
-    metric_cols[3].metric(tr("Skipped", "已略過"), sum((metrics.get("skipped") or {}).values()))
-    latency = metrics.get("average_event_to_playback_ms")
-    metric_cols[4].metric(tr("Avg. event-to-playback end", "事件到語音播完平均時間"), f"{latency} ms" if latency is not None else "N/A")
-    gift_cols = st.columns(3)
+    oldest_age = metrics.get("oldest_queue_age_seconds") or 0
+    metric_cols[3].metric(tr("Oldest queue age", "最久等待"), f"{oldest_age:.1f} s")
+    p50 = metrics.get("p50_event_to_playback_ms")
+    metric_cols[4].metric(tr("Event-to-playback p50", "事件至播報 p50"), f"{p50} ms" if p50 is not None else "N/A")
+    p95 = metrics.get("p95_event_to_playback_ms")
+    metric_cols[5].metric(tr("Event-to-playback p95", "事件至播報 p95"), f"{p95} ms" if p95 is not None else "N/A")
+    metric_cols[6].metric(tr("Skipped", "略過"), sum((metrics.get("skipped") or {}).values()))
+    gift_cols = st.columns(5)
     gift_cols[0].metric(tr("Gift events seen", "收到禮物事件"), metrics.get("gift_events_seen", 0))
     gift_cols[1].metric(tr("Gift announcements queued", "禮物已排入佇列"), metrics.get("gift_queued", 0))
     gift_cols[2].metric(tr("Gift announcements spoken", "已朗讀禮物"), metrics.get("gift_spoken", 0))
+    gift_cols[3].metric(tr("Gift delivery failures", "禮物播報失敗"), metrics.get("gift_delivery_failures", 0))
+    gift_cols[4].metric(tr("Synthesis / playback errors", "合成／播放錯誤"), metrics.get("synthesis_or_playback_errors", 0))
     if metrics.get("skipped"):
         with st.expander(tr("Skipped message counts", "略過訊息統計")):
             st.json(metrics["skipped"])

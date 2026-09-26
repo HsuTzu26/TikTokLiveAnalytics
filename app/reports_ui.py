@@ -109,17 +109,21 @@ def report_insights(report, start, end):
     notes.append('比較不同場次前，先查看人數採樣筆數及首末事件時間；收集較短的場次，留言或送禮總量可能較少。')
     return notes
 
-def render_reports(root: Path, streamers: list[str]):
+def render_reports(roots: Path | list[Path], streamers: list[str]):
+    roots = [roots] if isinstance(roots, (str, Path)) else [Path(root) for root in roots]
     st.title(tr('LIVE recap: weekly and monthly reports', '直播回顧：週報與月報'))
     st.caption(tr('Choose a date range to review audience, interaction, and gifts. Times use Taiwan time.', '選一段時間，看看人流、互動與送禮表現。所有時間皆為台灣時間。'))
+    st.caption(tr('Historical reports include both Collector sessions and LIVE session captures.', '歷史報表會合併 Collector 場次與 LIVE 場次資料。'))
     names = set(streamers)
-    for path in root.glob('*/session.json'):
-        try:
-            name = json.loads(path.read_text(encoding='utf-8')).get('username')
-            if name:
-                names.add(name)
-        except (OSError, ValueError):
-            pass
+    for root in roots:
+        for metadata_name in ('session.json', 'summary.json'):
+            for path in root.rglob(metadata_name):
+                try:
+                    name = json.loads(path.read_text(encoding='utf-8')).get('username')
+                    if name:
+                        names.add(name)
+                except (OSError, ValueError):
+                    pass
     cols = st.columns(2)
     username = cols[0].selectbox(tr('Which streamer?', '分析哪位直播主？'), sorted(names), key='report_username') if names else None
     mode_labels = {'Week': tr('Weekly', '週報'), 'Month': tr('Monthly', '月報'), 'Custom': tr('Custom dates', '自訂日期')}
@@ -144,7 +148,7 @@ def render_reports(root: Path, streamers: list[str]):
         else:
             start, end = period_bounds(mode, anchor)
         with st.spinner(tr('Preparing data and removing duplicate events…', '正在整理資料並排除重複事件…')):
-            st.session_state['generated_report'] = (username, start, end, build_report(root, username, start, end))
+            st.session_state['generated_report'] = (username, start, end, build_report(roots, username, start, end))
     saved = st.session_state.get('generated_report')
     if not saved:
         st.info(tr('Choose a streamer and period, then select Generate report.', '先選直播主及期間，再按「產生報表」。'))

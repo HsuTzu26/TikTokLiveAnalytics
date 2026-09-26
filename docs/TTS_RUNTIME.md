@@ -14,17 +14,20 @@ Start the Watcher in Streamlit, then choose Live TTS, configure voices and moder
 
 ## Processing behavior
 
-- Chat and eligible gift events share one FIFO queue in arrival order.
+- Chat and eligible gift events share one queue ordered by normalized event timestamp, with file sequence as a tie-breaker.
 - The default per-user cooldown and duplicate-text filter are disabled so repeated messages are retained. Both can still be enabled in the UI.
 - The default queue holds 500 entries. If it fills, the worker pauses reading the event file instead of discarding accepted messages.
-- To keep speech close to the live chat, events older than 5 seconds in the TTS queue are skipped by default. Set Maximum TTS queue age to 0 to retain every event and accept a longer delay.
+- Chat expires after 8 seconds by default; the setting can be changed from 5 to 15 seconds. Expired Chat increments `expired_chat`.
+- Captured, counted Gifts have no queue-age limit. A backend error or worker stop is recorded as a delivery failure instead of silently dropping the Gift.
 - A completed gift streak is announced once with the sender's nickname, gift name, and final quantity. Intermediate streak updates are not announced.
+- Chat speech contains the cleaned message only; it does not announce the username.
 - The voice selectors include common Traditional Chinese and English voices. Changing a voice automatically plays a short sentence in that language. Custom voice identifiers already in the config remain selectable.
-- Voice changes and voice-preview requests apply while the worker is running. A preview is placed ahead of queued chat and gift events.
+- Voice changes and voice-preview requests apply while the worker is running. A preview joins the same timestamp-ordered queue.
 - Sticker messages are announced as "send a sticker". URLs and emoji are removed by default; text is whitespace-normalized and capped at the configured character limit.
 - Common abbreviations such as IG, FB, YT, DM, and VIP are spaced into letter names for speech, and @ is spoken as "at". Displayed chat text is unchanged.
 - Remote TTS requests are spaced by at least 0.5 seconds by default. A transient synthesis or playback error retries that same event up to three times with exponential backoff before moving to the next event.
-- A prolonged TTS outage, an event rejected by filters, or stopping the worker can still prevent an announcement. TTS failures do not affect collection.
+- State reports queue depth, oldest wait age, bounded p50/p95 event-to-playback latency, skip reasons, and synthesis/playback errors. Latencies measure dispatch to playback after synthesis.
+- A prolonged TTS outage, an event rejected by filters, or stopping the worker can still prevent an announcement; the worker records these cases in its state. TTS failures do not affect collection.
 - Chat text is not copied to the TTS state or worker log. Audio plays through the computer's default audio device.
 
 The Provider Benchmark page refreshes live chat, gift charts, and viewer trends every five seconds. It supports multi-panel or single-panel layouts, a latest-item limit, and separate toggles for chat and gift lists.

@@ -1,4 +1,3 @@
-import argparse
 import asyncio
 import hashlib
 import json
@@ -19,9 +18,15 @@ from tiktok_live_events import TikTokLive
 try:
     from .snapshots import TikToolSnapshots, public_live_snapshot
     from .quota_policy import classify_limit, pause_until, paused
+    from .live_state import LiveStateWriter
+    from .rotating_log import RotatingTextLog
+    from .collector_cli import build_argument_parser
 except ImportError:
     from snapshots import TikToolSnapshots, public_live_snapshot
     from quota_policy import classify_limit, pause_until, paused
+    from live_state import LiveStateWriter
+    from rotating_log import RotatingTextLog
+    from collector_cli import build_argument_parser
 
 
 COLLECTOR_VERSION = "0.3"
@@ -322,43 +327,8 @@ def infer_social_action(event):
     return "other"
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="TikTok LIVE long-session analytics collector v0.3"
-    )
-    parser.add_argument(
-        "username",
-        help="TikTok LIVE username, with or without @",
-    )
-    parser.add_argument(
-        "--output-root",
-        default="data/raw",
-        help="Root directory for captured sessions (default: data/raw)",
-    )
-    parser.add_argument(
-        "--timezone",
-        default=DEFAULT_TIMEZONE,
-        help=f"Display timezone metadata (default: {DEFAULT_TIMEZONE})",
-    )
-    parser.add_argument(
-        "--max-reconnect-attempts",
-        type=int,
-        default=20,
-        help="Automatic reconnect attempts (default: 20)",
-    )
-    parser.add_argument(
-        "--offline-confirmations",
-        type=int,
-        default=3,
-        help="End the session after this many consecutive authoritative offline responses (default: 3)",
-    )
-    parser.add_argument(
-        "--snapshot-seconds",
-        type=int,
-        default=300,
-        help="Room/ranking snapshot interval; 0 disables snapshots (default: 300)",
-    )
-    args = parser.parse_args()
+def main(argv=None):
+    args = build_argument_parser().parse_args(argv)
 
     username = args.username.lstrip("@")
     local_tz = ZoneInfo(args.timezone)
@@ -374,6 +344,7 @@ def main():
     users_path = session_dir / "users.ndjson"
     diagnostics_path = session_dir / "diagnostics.ndjson"
     session_path = session_dir / "session.json"
+    live_state_path = session_dir / "live_state.json"
     collector_log_path = session_dir / "collector.log"
     snapshots_path = session_dir / "snapshots.ndjson"
     rankings_path = session_dir / "rankings.ndjson"
@@ -382,8 +353,10 @@ def main():
     events_fp = events_path.open(
         "a", encoding="utf-8", buffering=1
     )
-    raw_events_fp = raw_events_path.open(
-        "a", encoding="utf-8", buffering=1
+    raw_events_fp = (
+        raw_events_path.open("a", encoding="utf-8", buffering=1)
+        if args.capture_raw
+        else None
     )
     users_fp = users_path.open(
         "a", encoding="utf-8", buffering=1
@@ -391,8 +364,10 @@ def main():
     diagnostics_fp = diagnostics_path.open(
         "a", encoding="utf-8", buffering=1
     )
-    collector_log_fp = collector_log_path.open(
-        "a", encoding="utf-8", buffering=1
+    collector_log_fp = RotatingTextLog(
+        collector_log_path,
+        max_bytes=args.log_max_bytes,
+        backup_count=args.log_backups,
     )
     snapshots_fp = snapshots_path.open("a", encoding="utf-8", buffering=1)
     rankings_fp = rankings_path.open("a", encoding="utf-8", buffering=1)
@@ -420,7 +395,15 @@ def main():
         "offline_confirmed": False,
         "live_end_detected": False,
         "raw_event_count": 0,
+        "live_state_write_errors": 0,
+        "live_state_error_active": False,
     }
+
+    live_state_writer = LiveStateWriter(
+        live_state_path,
+        session_id=session_id,
+        username=username,
+    )
 
     session_meta = {
         "schema_version": SCHEMA_VERSION,
@@ -468,8 +451,12 @@ def main():
             "room",
         ],
         "event_counts": {},
-        "raw_event_file": raw_events_path.name,
+        "raw_event_file": raw_events_path.name if args.capture_raw else None,
+        "raw_event_capture_enabled": args.capture_raw,
         "raw_event_count": 0,
+        "live_state_file": live_state_path.name,
+        "live_state_schema_version": 1,
+        "live_state_write_errors": 0,
         "collector_log_file": collector_log_path.name,
         "snapshot_file": snapshots_path.name,
         "rankings_file": rankings_path.name,
@@ -514,6 +501,9 @@ def main():
             state["duplicate_event_counts"]
         )
         session_meta["raw_event_count"] = state["raw_event_count"]
+        session_meta["live_state_write_errors"] = state[
+            "live_state_write_errors"
+        ]
 
         tmp = session_path.with_suffix(".json.tmp")
         tmp.write_text(
@@ -522,11 +512,37 @@ def main():
         )
         tmp.replace(session_path)
 
+    def note_live_state_write_error(error):
+        state["live_state_write_errors"] += 1
+        session_meta["live_state_write_errors"] = state[
+            "live_state_write_errors"
+        ]
+        if state["live_state_error_active"]:
+            return
+        state["live_state_error_active"] = True
+        row = {
+            "session_id": session_id,
+            "kind": "live_state_write_error",
+            "error_type": type(error).__name__,
+            "received_at_ms": now_ms(),
+        }
+        try:
+            diagnostics_fp.write(json.dumps(row, ensure_ascii=False) + "\n")
+            diagnostics_fp.flush()
+        except OSError:
+            pass
+        print(f"[live-state-error] {type(error).__name__}", flush=True)
+
     def maybe_checkpoint(force=False):
         now_mono = time.monotonic()
         if force or now_mono - state["last_checkpoint_monotonic"] >= 30:
             atomic_save_session()
             state["last_checkpoint_monotonic"] = now_mono
+
+    try:
+        live_state_writer.flush(force=True)
+    except OSError as error:
+        note_live_state_write_error(error)
 
     def capture_user(user, observed_at_ms):
         snapshot = compact_user_snapshot(user)
@@ -641,12 +657,18 @@ def main():
         if source_event:
             capture_user(source_event.get("user"), received)
 
+        try:
+            live_state_writer.record(record)
+            state["live_state_error_active"] = False
+        except OSError as error:
+            note_live_state_write_error(error)
+
         maybe_checkpoint()
         return True
 
     def write_raw_event(event):
         """Persist every SDK event before type-specific normalization."""
-        if not isinstance(event, dict):
+        if raw_events_fp is None or not isinstance(event, dict):
             return
 
         received = now_ms()
@@ -1383,10 +1405,16 @@ def main():
             "sdk_error_events": state["error_event_count"],
         }
 
+        try:
+            live_state_writer.set_status(exit_status)
+        except OSError as error:
+            note_live_state_write_error(error)
+
         maybe_checkpoint(force=True)
 
         events_fp.close()
-        raw_events_fp.close()
+        if raw_events_fp is not None:
+            raw_events_fp.close()
         users_fp.close()
         diagnostics_fp.close()
         snapshots_fp.close()
