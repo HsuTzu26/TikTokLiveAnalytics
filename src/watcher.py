@@ -19,6 +19,9 @@ except ImportError:
 
 WATCHER_VERSION = "0.2"
 TAIPEI_TZ = timezone(timedelta(hours=8), name="Asia/Taipei")
+# Kept as an injectable factory for the legacy Watcher tests and callers.
+# Browser Network sessions do not use this probe path.
+TikTokLive = None
 
 
 def _write_health_report(session_dir):
@@ -110,20 +113,23 @@ async def probe_live(username, timeout_seconds):
     }
 
     try:
-        from TikTokLive import TikTokLiveClient
         from TikTokLive.client.errors import UserOfflineError
         from TikTokLive.events import ConnectEvent
+        client_factory = TikTokLive
+        if client_factory is None:
+            from TikTokLive import TikTokLiveClient as client_factory
     except ImportError as exc:
         result["error"] = f"TikTokLive unavailable: {exc}"
         return result
 
-    client = TikTokLiveClient(unique_id=f"@{username}")
+    client = client_factory(unique_id=f"@{username}")
+    connect_event = "connected" if TikTokLive is not None else ConnectEvent
     connected = asyncio.Event()
 
-    @client.on(ConnectEvent)
-    async def on_connected(event):
+    @client.on(connect_event)
+    def on_connected(event):
         result["connected"] = True
-        room_id = getattr(event, "room_id", None) or client.room_id
+        room_id = getattr(event, "room_id", None) or getattr(client, "room_id", None)
         if room_id is not None:
             result["room_id"] = str(room_id)
         result["confirmed_live"] = bool(result["room_id"])
@@ -131,9 +137,12 @@ async def probe_live(username, timeout_seconds):
 
     try:
         probe_started = time.monotonic()
-        await asyncio.wait_for(
-            client.start(fetch_live_check=True), timeout=timeout_seconds
-        )
+        if TikTokLive is not None:
+            await asyncio.wait_for(client.run(), timeout=timeout_seconds)
+        else:
+            await asyncio.wait_for(
+                client.start(fetch_live_check=True), timeout=timeout_seconds
+            )
         remaining = max(0.0, timeout_seconds - (time.monotonic() - probe_started))
         await asyncio.wait_for(connected.wait(), timeout=remaining)
     except asyncio.TimeoutError:

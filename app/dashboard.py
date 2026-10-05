@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from collections import Counter, defaultdict, deque
 from functools import lru_cache
 from pathlib import Path
@@ -19,8 +20,10 @@ from app.i18n import render_language_selector, tr
 # module so newly added functions do not remain hidden behind Python's module cache.
 import importlib
 import src.analytics as analytics_module
+import src.live_summary as live_summary_module
 
 analytics_module = importlib.reload(analytics_module)
+live_summary_module = importlib.reload(live_summary_module)
 audience_metrics = analytics_module.audience_metrics
 build_health_report = analytics_module.build_health_report
 compare_sessions = analytics_module.compare_sessions
@@ -40,6 +43,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DATA_ROOT = ROOT / "data"
 RAW_ROOT = DATA_ROOT / "raw"
 BENCHMARK_ROOT = DATA_ROOT / "v2_provider_benchmark"
+BROWSER_PROBE_ROOT = DATA_ROOT / "browser_ws_probe"
 WATCHER_STATE = DATA_ROOT / "watcher" / "watcher_state.json"
 WATCHER_LOG = DATA_ROOT / "watcher" / "watcher.log"
 WATCHER_PID = DATA_ROOT / "watcher" / "watcher.pid"
@@ -54,6 +58,43 @@ EMOTE_IMAGE_HOSTS = (
     "byteoversea.com",
     "ibyteimg.com",
 )
+
+
+def _file_signature(path: Path) -> tuple[int, int]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return 0, 0
+    return stat.st_mtime_ns, stat.st_size
+
+
+@st.cache_data(max_entries=32)
+def _cached_session_report(
+    session_dir: str,
+    events_mtime_ns: int,
+    events_size: int,
+    metadata_mtime_ns: int,
+    tts_state_mtime_ns: int,
+    gift_catalog_mtime_ns: int,
+) -> dict:
+    """Cache post-LIVE summaries until one of their source files changes."""
+    del events_mtime_ns, events_size, metadata_mtime_ns, tts_state_mtime_ns, gift_catalog_mtime_ns
+    return live_summary_module.build_live_summary(Path(session_dir))
+
+
+def load_session_report(session_dir: Path) -> dict:
+    events_mtime, events_size = _file_signature(session_dir / "events.ndjson")
+    metadata_mtime, _ = _file_signature(session_dir / "session.json")
+    tts_state_mtime, _ = _file_signature(DATA_ROOT / "tts" / "state.json")
+    catalog_mtime, _ = _file_signature(ROOT / "src" / "tts" / "gift_catalog.json")
+    return _cached_session_report(
+        str(session_dir.resolve()),
+        events_mtime,
+        events_size,
+        metadata_mtime,
+        tts_state_mtime,
+        catalog_mtime,
+    )
 
 
 st.set_page_config(
@@ -210,22 +251,452 @@ def stop_watcher() -> str:
 
 
 def session_dirs(username: str | None = None) -> list[Path]:
-    if not RAW_ROOT.exists():
-        return []
     result = []
-    for path in RAW_ROOT.iterdir():
-        if not path.is_dir() or not (path / "session.json").exists():
+    for root in (RAW_ROOT, BROWSER_PROBE_ROOT):
+        if not root.exists():
             continue
-        if username and not path.name.endswith(f"_{username}"):
+        try:
+            for path in root.iterdir():
+                if not path.is_dir():
+                    continue
+                metadata = session_metadata(path)
+                if not isinstance(metadata, dict):
+                    continue
+                if not (path / "session.json").exists() and not _browser_capture_is_active(path):
+                    continue
+                session_username = str(metadata.get("username") or "")
+                if username and session_username.casefold() != username.casefold():
+                    continue
+                result.append(path)
+        except OSError:
             continue
-        result.append(path)
     return sorted(result, key=lambda item: item.name, reverse=True)
 
 
 def session_metadata(path: Path) -> dict:
-    """Read metadata from either a Collector or Provider Benchmark session."""
+    """Read metadata from Collector, Browser Network, or benchmark sessions."""
     metadata = read_json(path / "session.json", {})
-    return metadata or read_json(path / "summary.json", {})
+    if metadata:
+        if _is_browser_session(path):
+            metadata.setdefault("provider", "browser_network")
+        return metadata
+    summary = read_json(path / "summary.json", {})
+    if summary:
+        return summary
+    if _browser_capture_is_active(path):
+        parts = path.name.split("_", 2)
+        username = parts[2] if len(parts) == 3 else "unknown"
+        return {
+            "session_id": path.name,
+            "username": username,
+            "provider": "browser_network",
+            "browser_mode": "cdp",
+            "status": "running",
+        }
+    return {}
+
+
+def _is_browser_session(path: Path) -> bool:
+    try:
+        return path.resolve().is_relative_to(BROWSER_PROBE_ROOT.resolve())
+    except (OSError, ValueError):
+        return False
+
+
+def _browser_capture_is_active(path: Path) -> bool:
+    if not _is_browser_session(path) or (path / "session.json").exists():
+        return False
+    events_path = path / "events.ndjson"
+    try:
+        return events_path.is_file() and time.time() - events_path.stat().st_mtime <= 120
+    except OSError:
+        return False
+
+
+def active_browser_session_dirs() -> list[Path]:
+    if not BROWSER_PROBE_ROOT.exists():
+        return []
+    active = []
+    try:
+        for path in BROWSER_PROBE_ROOT.iterdir():
+            if not path.is_dir():
+                continue
+            metadata = read_json(path / "session.json", {})
+            metadata_running = metadata.get("status") == "running"
+            try:
+                snapshot_fresh = (
+                    (path / "session.json").is_file()
+                    and time.time() - (path / "session.json").stat().st_mtime <= 30
+                )
+            except OSError:
+                snapshot_fresh = False
+            if (metadata_running and snapshot_fresh) or _browser_capture_is_active(path):
+                if (path / "events.ndjson").is_file():
+                    active.append(path)
+    except OSError:
+        return []
+    return sorted(active, key=lambda item: item.name, reverse=True)
+
+
+_BROWSER_LIVE_CACHE: dict[str, dict] = {}
+_BROWSER_VIEWER_CORRECTION_EXECUTOR = ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="browser-viewer-correction",
+)
+_BROWSER_VIEWER_CORRECTION_JOBS: dict[str, Future] = {}
+
+
+@lru_cache(maxsize=1024)
+def _decode_browser_viewer_frame(
+    frame_path: str, modified_ns: int, size: int
+) -> tuple[tuple[str, int], ...]:
+    """Read the current viewer count from older raw frames when available."""
+    del modified_ns, size
+    try:
+        from src.providers.browser_network import decode_webcast_frame
+
+        events, _ = decode_webcast_frame(Path(frame_path).read_bytes())
+    except Exception:
+        return ()
+    decoded = []
+    for envelope in events:
+        event = envelope.get("normalized") if isinstance(envelope, dict) else None
+        if not isinstance(event, dict):
+            event = envelope
+        if not isinstance(event, dict) or event.get("type") != "viewer":
+            continue
+        value = event.get("viewer_count")
+        if isinstance(value, (int, float)):
+            msg_id = event.get("msg_id")
+            if not msg_id and isinstance(envelope, dict):
+                msg_id = envelope.get("msg_id")
+            decoded.append((str(msg_id or ""), int(value)))
+    return tuple(decoded)
+
+
+def browser_viewer_count(session_dir: Path, event: dict) -> int | float | None:
+    """Use the frame's current audience field to fix sessions captured by old code."""
+    try:
+        frame_seq = int(event.get("frame_seq"))
+        if frame_seq < 1:
+            return event.get("viewer_count")
+        frame_path = session_dir / "frames" / f"frame_{frame_seq:06d}.bin"
+        stat = frame_path.stat()
+        counts = _decode_browser_viewer_frame(
+            str(frame_path), stat.st_mtime_ns, stat.st_size
+        )
+    except (OSError, TypeError, ValueError):
+        return event.get("viewer_count")
+    msg_id = str(event.get("msg_id") or "")
+    if msg_id:
+        match = next((count for candidate, count in counts if candidate == msg_id), None)
+        if match is not None:
+            return match
+    if len(counts) == 1:
+        return counts[0][1]
+    return event.get("viewer_count")
+
+
+def _build_corrected_browser_viewer_rows(session_dir: str) -> list[dict]:
+    """Rebuild archived viewer samples from raw frames without blocking the UI."""
+    root = Path(session_dir)
+    rows = []
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            kernel = ctypes.windll.kernel32
+            kernel.SetThreadPriority(kernel.GetCurrentThread(), -1)
+        except (AttributeError, OSError):
+            pass
+    try:
+        with (root / "events.ndjson").open("r", encoding="utf-8") as events:
+            for line in events:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") not in {"viewer", "roomUserSeq"}:
+                    continue
+                received_at_ms = event.get("received_at_ms") or event.get("timestamp_ms")
+                event_time = (
+                    event.get("received_at_local")
+                    or event.get("timestamp_local")
+                    or event.get("received_at_utc")
+                    or event.get("timestamp_utc")
+                )
+                if not event_time and isinstance(received_at_ms, (int, float)):
+                    event_time = pd.Timestamp(received_at_ms, unit="ms", tz="UTC").tz_convert(TAIPEI_TZ).isoformat()
+                value = browser_viewer_count(root, event)
+                if isinstance(value, (int, float)) and event_time:
+                    rows.append({
+                        "time": event_time,
+                        "received_at_ms": received_at_ms if isinstance(received_at_ms, (int, float)) else None,
+                        "viewer_count": value,
+                        "session_id": event.get("session_id") or root.name,
+                    })
+                # Yield between protobuf frames so UI work and browser input
+                # retain priority on slower Windows machines.
+                time.sleep(0.001)
+    except OSError:
+        return []
+    rows.sort(key=_viewer_sample_order)
+    return rows
+
+
+def corrected_browser_viewer_rows(session_dir: Path) -> list[dict] | None:
+    """Return corrected archived samples when ready, scheduling work otherwise."""
+    session_dir = Path(session_dir).resolve()
+    events_mtime_ns, events_size = _file_signature(session_dir / "events.ndjson")
+    frames_mtime_ns, _ = _file_signature(session_dir / "frames")
+    job_key = f"{session_dir}:{events_mtime_ns}:{events_size}:{frames_mtime_ns}"
+    future = _BROWSER_VIEWER_CORRECTION_JOBS.get(job_key)
+    if future is None:
+        future = _BROWSER_VIEWER_CORRECTION_EXECUTOR.submit(
+            _build_corrected_browser_viewer_rows,
+            str(session_dir),
+        )
+        _BROWSER_VIEWER_CORRECTION_JOBS[job_key] = future
+        while len(_BROWSER_VIEWER_CORRECTION_JOBS) > 32:
+            oldest_key = next(iter(_BROWSER_VIEWER_CORRECTION_JOBS))
+            oldest = _BROWSER_VIEWER_CORRECTION_JOBS[oldest_key]
+            if not oldest.done():
+                break
+            _BROWSER_VIEWER_CORRECTION_JOBS.pop(oldest_key, None)
+    if not future.done():
+        return None
+    try:
+        return future.result()
+    except Exception:
+        return []
+
+
+def _correct_browser_metrics(
+    metrics: dict,
+    session_dirs_to_correct: list[Path],
+    *,
+    request_correction: bool = False,
+) -> tuple[dict, bool, bool]:
+    """Keep archived Browser viewer corrections opt-in and off the UI thread."""
+    browser_paths = [path for path in session_dirs_to_correct if _is_browser_session(path)]
+    if not browser_paths:
+        return metrics, False, False
+    browser_session_ids = {path.name for path in browser_paths}
+    corrected_rows = [
+        row for row in metrics.get("viewer_rows", [])
+        if row.get("session_id") not in browser_session_ids
+    ]
+    pending = False
+    required = False
+    for path in browser_paths:
+        source_rows = [
+            row for row in metrics.get("viewer_rows", [])
+            if row.get("session_id") == path.name
+        ]
+        frame_rows = [row for row in source_rows if row.get("frame_seq")]
+        has_saved_frame = any(
+            (path / "frames" / f"frame_{int(row['frame_seq']):06d}.bin").is_file()
+            for row in frame_rows[:8]
+        )
+        if not has_saved_frame:
+            corrected_rows.extend(source_rows)
+            continue
+        if not request_correction:
+            required = True
+            continue
+        rows = corrected_browser_viewer_rows(path)
+        if rows is None:
+            pending = True
+        else:
+            corrected_rows.extend(rows)
+    if not pending:
+        corrected_rows.sort(key=_viewer_sample_order)
+    result = dict(metrics)
+    result["viewer_rows"] = corrected_rows
+    result["viewers"] = [row["viewer_count"] for row in result["viewer_rows"]]
+    result["viewer_correction_pending"] = pending
+    result["viewer_correction_required"] = required
+    return result, pending, required
+
+
+def browser_live_state(session_dir: Path) -> dict:
+    """Incrementally read normalized Browser Provider events for the live page."""
+    events_path = session_dir / "events.ndjson"
+    key = str(events_path.resolve())
+    try:
+        size = events_path.stat().st_size
+    except OSError:
+        return {}
+    cache = _BROWSER_LIVE_CACHE.get(key)
+    if cache is None or size < cache["offset"]:
+        cache = {
+            "offset": 0,
+            "event_counts": Counter(),
+            "viewer_samples": deque(maxlen=600),
+            "recent_chat": deque(maxlen=100),
+            "recent_gifts": deque(maxlen=100),
+            "recent_members": deque(maxlen=100),
+            "viewer_count": None,
+            "latest_viewer_at_ms": None,
+            "likes_total": 0,
+            "diamonds": 0,
+            "chat_count": 0,
+            "gift_count": 0,
+            "member_count": 0,
+            "last_event_at_ms": None,
+        }
+        _BROWSER_LIVE_CACHE[key] = cache
+
+    if size > cache["offset"]:
+        initial_read = cache["offset"] == 0
+        try:
+            with events_path.open("rb") as handle:
+                handle.seek(cache["offset"])
+                payload = handle.read()
+                cache["offset"] = handle.tell()
+        except OSError:
+            payload = b""
+        for raw_line in payload.splitlines():
+            try:
+                event = json.loads(raw_line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(event, dict):
+                continue
+            event_type = str(event.get("type") or "unknown")
+            cache["event_counts"][event_type] += 1
+            received_ms = event.get("received_at_ms") or event.get("timestamp_ms")
+            if isinstance(received_ms, (int, float)):
+                cache["last_event_at_ms"] = int(received_ms)
+            event_time = (
+                event.get("received_at_local")
+                or event.get("timestamp_local")
+                or event.get("received_at_utc")
+                or event.get("timestamp_utc")
+            )
+            user = event.get("unique_id") or event.get("nickname") or event.get("user_id")
+            if event_type == "viewer":
+                value = (
+                    event.get("viewer_count")
+                    if initial_read
+                    else browser_viewer_count(session_dir, event)
+                )
+                if isinstance(value, (int, float)):
+                    cache["viewer_count"] = int(value)
+                    cache["latest_viewer_at_ms"] = received_ms
+                    cache["viewer_samples"].append({
+                        "received_at_ms": received_ms,
+                        "viewer_count": int(value),
+                    })
+                    if initial_read:
+                        cache["bootstrap_latest_viewer_event"] = event
+            elif event_type == "like":
+                try:
+                    total = int(event.get("total_likes") or 0)
+                    increment = int(event.get("like_count") or 0)
+                    cache["likes_total"] = max(cache["likes_total"], total or cache["likes_total"] + increment)
+                except (TypeError, ValueError, OverflowError):
+                    pass
+            elif event_type == "chat":
+                cache["chat_count"] += 1
+                cache["recent_chat"].append({
+                    "time": event_time,
+                    "user": user,
+                    "comment": event.get("comment"),
+                })
+            elif event_type == "gift" and event.get("counted"):
+                cache["gift_count"] += 1
+                try:
+                    cache["diamonds"] += int(event.get("diamond_total") or 0)
+                except (TypeError, ValueError, OverflowError):
+                    pass
+                cache["recent_gifts"].append({
+                    "time": event_time,
+                    "user": user,
+                    "gift_name": event.get("gift_name") or "unknown",
+                    "gift_id": event.get("gift_id"),
+                    "quantity": event.get("repeat_count") or 1,
+                    "diamonds": event.get("diamond_total") or 0,
+                })
+            elif event_type == "member":
+                cache["member_count"] += 1
+                cache["recent_members"].append({
+                    "time": event_time,
+                    "user": user,
+                    "fan_club_level": event.get("fan_club_level"),
+                    "user_grade_level": event.get("user_grade_level"),
+                    "entry_source": event.get("entry_source"),
+                })
+
+        if initial_read and cache.get("bootstrap_latest_viewer_event"):
+            latest_viewer_event = cache.pop("bootstrap_latest_viewer_event")
+            corrected_latest = browser_viewer_count(session_dir, latest_viewer_event)
+            if isinstance(corrected_latest, (int, float)):
+                cache["viewer_count"] = int(corrected_latest)
+                cache["latest_viewer_at_ms"] = (
+                    latest_viewer_event.get("received_at_ms")
+                    or latest_viewer_event.get("timestamp_ms")
+                )
+                if cache["viewer_samples"]:
+                    cache["viewer_samples"][-1]["viewer_count"] = int(corrected_latest)
+
+    latest_socket_state = "unknown"
+    live_sockets: set[str] = set()
+    target_connections = 0
+    target_url = None
+    try:
+        with (session_dir / "sockets.ndjson").open("r", encoding="utf-8") as rows:
+            for line in rows:
+                try:
+                    socket = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not socket.get("live_candidate"):
+                    continue
+                request_id = str(socket.get("request_id") or "")
+                state = socket.get("state")
+                if state == "created":
+                    target_connections += 1
+                    if request_id:
+                        live_sockets.add(request_id)
+                elif state in {"handshake", "classified_live"}:
+                    latest_socket_state = "connected"
+                    target_url = socket.get("url") or target_url
+                    if request_id:
+                        live_sockets.add(request_id)
+                elif state == "closed":
+                    if request_id:
+                        live_sockets.discard(request_id)
+                    latest_socket_state = "reconnecting" if not live_sockets else "connected"
+    except OSError:
+        pass
+    if live_sockets:
+        latest_socket_state = "connected"
+    elif cache["event_counts"].get("live_ended"):
+        latest_socket_state = "session_ended"
+    elif latest_socket_state == "unknown" and cache["event_counts"]:
+        latest_socket_state = "reconnecting"
+
+    last_event_ms = cache.get("last_event_at_ms")
+    return {
+        "username": session_metadata(session_dir).get("username"),
+        "connection_state": latest_socket_state,
+        "target_websocket_connection_count": target_connections,
+        "target_websocket_url": target_url,
+        "last_event_at_ms": last_event_ms,
+        "viewer_count": cache["viewer_count"],
+        "latest_viewer_at_ms": cache["latest_viewer_at_ms"],
+        "viewer_samples": list(cache["viewer_samples"]),
+        "likes_total": cache["likes_total"],
+        "diamonds": cache["diamonds"],
+        "chat_count": cache["chat_count"],
+        "gift_count": cache["gift_count"],
+        "member_count": cache["member_count"],
+        "recent_chat": list(cache["recent_chat"]),
+        "recent_gifts": list(cache["recent_gifts"]),
+        "recent_members": list(cache["recent_members"]),
+        "event_counts": dict(cache["event_counts"]),
+    }
 
 
 def benchmark_session_dirs() -> list[Path]:
@@ -364,7 +835,7 @@ def resolve_session(manual_id: str, username: str, selected_id: str) -> Path | N
     return candidates[0] if candidates else None
 
 
-def load_session(session_dir: Path | None):
+def _load_session_uncached(session_dir: Path | None):
     summary = {
         "session": None,
         "counts": Counter(),
@@ -389,6 +860,7 @@ def load_session(session_dir: Path | None):
     if session_dir is None:
         return summary
 
+    is_browser = _is_browser_session(session_dir)
     summary["session"] = session_metadata(session_dir)
     events_path = session_dir / "events.ndjson"
     try:
@@ -405,13 +877,25 @@ def load_session(session_dir: Path | None):
 
             event_type = event.get("type")
             summary["counts"][event_type] += 1
-            event_time = (
-                event.get("timestamp_local")
-                or event.get("received_at_local")
-                or event.get("timestamp_utc")
-                or event.get("received_at_utc")
-            )
-            event_time_ms = event.get("timestamp_ms") or event.get("received_at_ms")
+            if event_type in {"viewer", "roomUserSeq"}:
+                # Viewer samples represent the count observed by this process;
+                # use receive time so delayed or out-of-order source timestamps
+                # cannot make an older sample appear current.
+                event_time = (
+                    event.get("received_at_local")
+                    or event.get("timestamp_local")
+                    or event.get("received_at_utc")
+                    or event.get("timestamp_utc")
+                )
+                event_time_ms = event.get("received_at_ms") or event.get("timestamp_ms")
+            else:
+                event_time = (
+                    event.get("timestamp_local")
+                    or event.get("received_at_local")
+                    or event.get("timestamp_utc")
+                    or event.get("received_at_utc")
+                )
+                event_time_ms = event.get("timestamp_ms") or event.get("received_at_ms")
             if not event_time and isinstance(event_time_ms, (int, float)):
                 event_time = pd.Timestamp(event_time_ms, unit="ms", tz="UTC").tz_convert(TAIPEI_TZ).isoformat()
 
@@ -421,7 +905,11 @@ def load_session(session_dir: Path | None):
                     summary["viewers"].append(value)
                     summary["viewer_rows"].append({
                         "time": event_time,
+                        "received_at_ms": event_time_ms if isinstance(event_time_ms, (int, float)) else None,
                         "viewer_count": value,
+                        "frame_seq": event.get("frame_seq") if is_browser else None,
+                        "msg_id": event.get("msg_id") if is_browser else None,
+                        "session_id": session_dir.name,
                     })
             elif event_type == "like":
                 batch_count = int(event.get("like_count", 0) or 0)
@@ -482,9 +970,33 @@ def load_session(session_dir: Path | None):
                     "detail": detail,
                 })
 
+    summary["viewer_rows"].sort(key=_viewer_sample_order)
+    summary["viewers"] = [row["viewer_count"] for row in summary["viewer_rows"]]
     summary["recent_chat"] = summary["recent_chat"][-200:][::-1]
     summary["recent_activity"] = summary["recent_activity"][-50:][::-1]
     return summary
+
+
+@lru_cache(maxsize=64)
+def _cached_session_events(
+    session_path: str,
+    events_mtime_ns: int,
+    events_size: int,
+    metadata_mtime_ns: int,
+):
+    del events_mtime_ns, events_size, metadata_mtime_ns
+    return _load_session_uncached(Path(session_path))
+
+
+def load_session(session_dir: Path | None):
+    if session_dir is None:
+        return _load_session_uncached(None)
+    session_dir = Path(session_dir).resolve()
+    events_mtime_ns, events_size = _file_signature(session_dir / "events.ndjson")
+    metadata_mtime_ns, _ = _file_signature(session_dir / "session.json")
+    return _cached_session_events(
+        str(session_dir), events_mtime_ns, events_size, metadata_mtime_ns
+    )
 
 
 def room_session_dirs(username: str, room_id: str | None) -> list[Path]:
@@ -528,13 +1040,24 @@ def combine_session_metrics(paths: list[Path], preferred: Path | None = None):
             combined["like_first_total"] = metrics["like_first_total"]
             combined["like_baseline_estimate"] = metrics["like_baseline_estimate"]
     combined["likes"] = combined["like_current_total"] if combined["like_current_total"] is not None else combined["likes_observed"]
-    combined["viewer_rows"].sort(key=lambda row: str(row.get("time") or ""))
+    combined["viewer_rows"].sort(key=_viewer_sample_order)
+    combined["viewers"] = [row["viewer_count"] for row in combined["viewer_rows"]]
     combined["activity_rows"].sort(key=lambda row: str(row.get("time") or ""))
     combined["recent_chat"] = sorted(combined["recent_chat"], key=lambda row: str(row.get("time") or ""), reverse=True)[:200]
     combined["recent_activity"] = sorted(combined["recent_activity"], key=lambda row: str(row.get("time") or ""), reverse=True)[:50]
     combined["session"] = read_json(preferred / "session.json", {}) if preferred else (fragments[-1]["session"] if fragments else None)
     combined["fragment_count"] = len(paths)
     return combined
+
+
+def _viewer_sample_order(row: dict) -> float:
+    received_at_ms = row.get("received_at_ms")
+    if isinstance(received_at_ms, (int, float)):
+        return float(received_at_ms)
+    try:
+        return pd.Timestamp(row.get("time")).timestamp() * 1000
+    except (TypeError, ValueError, OverflowError):
+        return float("-inf")
 
 
 def local_timestamp(value):
@@ -995,8 +1518,15 @@ def latest_live_session(username: str | None) -> Path | None:
         return None
     candidates = []
     for path in session_dirs(username):
-        meta = read_json(path / "session.json", {})
+        meta = session_metadata(path)
         if meta.get("status") == "running":
+            if _is_browser_session(path):
+                try:
+                    snapshot_fresh = time.time() - (path / "session.json").stat().st_mtime <= 30
+                except OSError:
+                    snapshot_fresh = False
+                if not snapshot_fresh and not _browser_capture_is_active(path):
+                    continue
             candidates.append((str(meta.get("collector_started_at_utc") or path.name), path))
     return max(candidates, key=lambda item: item[0])[1] if candidates else None
 
@@ -1044,10 +1574,15 @@ def render_current_connection_status(username: str, watcher_state: dict) -> None
 
     collector = latest_live_session(username)
     if collector:
-        live_state = read_json(collector / "live_state.json", {})
-        socket_state = str(live_state.get("connection_state") or "starting")
-        if socket_state == "disconnected" and live_state.get("current_gap_started_at_ms") is not None:
-            socket_state = "reconnecting"
+        collector_metadata = session_metadata(collector)
+        if collector_metadata.get("provider") == "browser_network":
+            live_state = browser_live_state(collector)
+            socket_state = str(live_state.get("connection_state") or "starting")
+        else:
+            live_state = read_json(collector / "live_state.json", {})
+            socket_state = str(live_state.get("connection_state") or "starting")
+            if socket_state == "disconnected" and live_state.get("current_gap_started_at_ms") is not None:
+                socket_state = "reconnecting"
         socket_labels = {
             "connected": tr("Connected", "WebSocket 已連線"),
             "disconnected": tr("Disconnected", "WebSocket 已中斷"),
@@ -1060,6 +1595,8 @@ def render_current_connection_status(username: str, watcher_state: dict) -> None
             "unknown": tr("Waiting for signal", "等待連線訊號"),
         }
         collector_label = socket_labels.get(socket_state, socket_state)
+        if collector_metadata.get("provider") == "browser_network":
+            collector_label = f"Browser CDP · {collector_label}"
     else:
         active_benchmark = next(
             (
@@ -1068,9 +1605,19 @@ def render_current_connection_status(username: str, watcher_state: dict) -> None
             ),
             None,
         )
+        active_browser = next(
+            (
+                path for path in active_browser_session_dirs()
+                if str(session_metadata(path).get("username") or "").lstrip("@").casefold() == username.casefold()
+            ),
+            None,
+        )
         collector_label = (
+            tr("Browser capture; see Dashboard", "Browser 正在擷取；請查看儀表板")
+            if active_browser else (
             tr("Active capture; see Live Sessions", "場次收集中；請到 Live Sessions 查看連線訊號")
             if active_benchmark else tr("Not connected", "Collector 未連線")
+            )
         )
 
     probe_col, collector_col = st.columns(2)
@@ -1102,8 +1649,19 @@ def render_live_tracking(session_dir: Path | None, metrics: dict, streamer_state
         f"{tr('last event', '最近事件')}={session.get('last_received_at_local') or tr('waiting', '等待中')}"
     )
     cols = st.columns(6)
-    cols[0].metric(tr("Watch status", "監控狀態"), streamer_state.get("status", "unknown"))
-    cols[1].metric(tr("Current viewer", "目前觀眾數"), metrics["viewers"][-1] if metrics["viewers"] else "N/A")
+    is_browser = session.get("provider") == "browser_network"
+    cols[0].metric(
+        tr("Capture source", "\u64f7\u53d6\u4f86\u6e90") if is_browser else tr("Watch status", "\u89c0\u6e2c\u72c0\u614b"),
+        "Browser Network" if is_browser else streamer_state.get("status", "unknown"),
+    )
+    cols[1].metric(
+        tr("Latest viewer sample", "\u6700\u65b0\u89c0\u773e\u6578\u6a23\u672c"),
+        metrics["viewers"][-1] if metrics["viewers"] else "N/A",
+        help=tr(
+            "Most recent viewer sample received by the collector.",
+            "\u6536\u64da\u7aef\u6700\u8fd1\u6536\u5230\u7684\u89c0\u773e\u6578\u6a23\u672c\u3002",
+        ) if is_browser else None,
+    )
     cols[2].metric(tr("Current likes", "目前按讚數"), metrics["like_current_total"] if metrics["like_current_total"] is not None else metrics["likes"])
     cols[3].metric(tr("Captured diamonds (room)", "直播間紀錄 Diamonds"), int(metrics["diamonds"]))
     cols[4].metric(tr("Chat", "聊天"), metrics["chat"])
@@ -1122,8 +1680,8 @@ def render_provider_benchmark():
     st.title(tr("Live Sessions", "直播場次"))
     st.caption(
         tr(
-            "Read-only session dashboard for active and completed LIVE captures. It refreshes every five seconds; the Collector WebSocket state comes from its latest connection signal, separately from the Watcher LIVE probe.",
-            "唯讀查看進行中或已完成的直播場次，每五秒更新一次。Collector WebSocket 狀態依最後連線訊號顯示，與 Watcher 的 LIVE 探測分開。",
+            "Read-only session dashboard for active and completed LIVE captures. It refreshes every five seconds and shows connection signals recorded by the selected capture session.",
+            "\u6b64\u9801\u986f\u793a\u9032\u884c\u4e2d\u548c\u5df2\u5b8c\u6210\u7684 LIVE \u64f7\u53d6\u5834\u6b21\uff0c\u6bcf\u4e94\u79d2\u66f4\u65b0\uff0c\u9023\u7dda\u72c0\u614b\u4f9d\u6240\u9078\u64f7\u53d6\u5834\u6b21\u8a18\u9304\u7684\u8a0a\u865f\u986f\u793a\u3002",
         )
     )
     paths = benchmark_session_dirs()
@@ -1165,7 +1723,7 @@ def render_provider_benchmark():
         tr("Collector WebSocket", "Collector WebSocket"),
         connection_labels.get(report.get("connection_state"), tr("Unknown", "未知")),
         help=tr(
-            "LIVE means the selected Collector last recorded a connected socket. Not LIVE requires an explicit LIVE end event. Other states describe reconnects, stale signals, or errors; this is separate from the Watcher probe.",
+            "LIVE means the selected capture last recorded a connected socket. Not LIVE requires an explicit LIVE end event. Other states describe reconnects, stale signals, or errors.",
             "直播中表示所選 Collector 最後記錄到 WebSocket 已連線；未開播須有明確的直播結束事件。其他狀態表示重連、訊號逾時或錯誤；這與 Watcher 探測分開。",
         ),
     )
@@ -1552,9 +2110,14 @@ def render_provider_benchmark():
 
 def render_lightweight_live_view(session_dir: Path, streamer_state: dict) -> bool:
     """Render the bounded live-state snapshot and report whether full history was requested."""
-    metadata = read_json(session_dir / "session.json", {})
-    live_state = read_json(session_dir / "live_state.json", {})
-    if not live_state:
+    metadata = session_metadata(session_dir)
+    is_browser = metadata.get("provider") == "browser_network"
+    live_state = (
+        browser_live_state(session_dir)
+        if is_browser
+        else read_json(session_dir / "live_state.json", {})
+    )
+    if not live_state and not is_browser:
         st.warning(
             tr(
                 "This collector session has no lightweight live state yet. Restart the collector to enable live-state updates, or request a full historical scan below.",
@@ -1609,89 +2172,56 @@ def render_lightweight_live_view(session_dir: Path, streamer_state: dict) -> boo
         }
         columns = st.columns(7)
         columns[0].metric(
-            tr("Collector WebSocket", "Collector WebSocket"),
+            tr("Browser LIVE WebSocket", "瀏覽器 LIVE WebSocket") if is_browser else tr("Collector WebSocket", "Collector WebSocket"),
             socket_labels.get(socket_state, tr("Error", "錯誤") if "error" in socket_state.casefold() else socket_state),
             help=tr(
+                "Passive connection state observed through Chrome CDP.",
+                "透過 Chrome CDP 被動觀察到的連線狀態。",
+            ) if is_browser else tr(
                 "Connection state reported by the long-running Collector socket.",
                 "長時間運作的 Collector WebSocket 回報的連線狀態。",
             ),
         )
         watcher_task = str(streamer_state.get("status") or "unknown")
-        columns[1].metric(
-            tr("Watcher task", "Watcher 工作狀態"),
-            watcher_task_labels.get(watcher_task, watcher_task),
-        )
+        if is_browser:
+            columns[1].metric(
+                tr("Browser capture", "瀏覽器擷取"),
+                tr("LIVE ended", "直播已結束") if socket_state == "session_ended" else tr("Observing", "觀測中"),
+            )
+        else:
+            columns[1].metric(
+                tr("Watcher task", "Watcher 工作狀態"),
+                watcher_task_labels.get(watcher_task, watcher_task),
+            )
         viewer_count = live_state.get("viewer_count")
+        viewer_at_ms = live_state.get("latest_viewer_at_ms")
+        viewer_time_help = tr(
+            "Latest WebcastRoomUserSeqMessage count observed through Chrome CDP.",
+            "\u900f\u904e Chrome CDP \u89c0\u5bdf\u5230\u7684\u6700\u65b0 WebcastRoomUserSeqMessage \u4eba\u6578\u3002",
+        )
+        if isinstance(viewer_at_ms, (int, float)):
+            viewer_time = pd.to_datetime(viewer_at_ms, unit="ms", utc=True).tz_convert(TAIPEI_TZ)
+            viewer_time_help += " " + tr("Sample received", "\u6a23\u672c\u6536\u5230\u6642\u9593") + ": " + viewer_time.strftime("%H:%M:%S")
         columns[2].metric(
-            tr("Current viewers", "目前觀眾數"),
+            tr("Latest viewer sample", "\u6700\u65b0\u89c0\u773e\u6578\u6a23\u672c"),
             viewer_count if viewer_count is not None else "N/A",
+            help=viewer_time_help,
         )
         columns[3].metric(tr("Likes", "按讚"), live_state.get("likes_total") or 0)
         columns[4].metric(tr("Diamonds", "鑽石數"), int(live_state.get("diamonds") or 0))
         columns[5].metric(tr("Chat", "聊天"), live_state.get("chat_count", 0))
         columns[6].metric(tr("Gifts", "禮物"), live_state.get("gift_count", 0))
 
-        last_probe = pd.to_datetime(
-            streamer_state.get("last_probe_at_utc"), utc=True, errors="coerce"
-        )
-        last_confirmed_live = pd.to_datetime(
-            streamer_state.get("last_confirmed_live_at_utc"), utc=True, errors="coerce"
-        )
-        probe_error_text = str(streamer_state.get("last_probe_error") or "")
-        probe_age = (
-            max(0.0, (pd.Timestamp.now(tz="UTC") - last_probe).total_seconds())
-            if pd.notna(last_probe) else None
-        )
-        watcher_config = read_json(CONFIG_PATH, {})
-        configured_poll_seconds = watcher_config.get("poll_seconds", 60)
-        try:
-            offline_confirmations = max(1, int(watcher_config.get("offline_confirmations", 3)))
-        except (TypeError, ValueError):
-            offline_confirmations = 3
-        try:
-            probe_stale_after = max(180, float(configured_poll_seconds) * 3)
-        except (TypeError, ValueError):
-            probe_stale_after = 180
-        if probe_age is not None and probe_age > probe_stale_after:
-            probe_result = tr("Probe stale", "探測逾時")
-            probe_error = ""
-        elif "is not currently live" in probe_error_text.casefold():
-            misses = int(streamer_state.get("consecutive_misses") or 0)
-            probe_result = (
-                tr("Not LIVE", "未開播")
-                if misses >= offline_confirmations
-                else tr(
-                    f"Confirming not LIVE ({misses}/{offline_confirmations})",
-                    f"確認未開播中（{misses}/{offline_confirmations}）",
-                )
+        if is_browser:
+            st.caption(
+                f"{tr('Observed LIVE socket', '\u89c0\u5bdf\u5230\u7684 LIVE \u9023\u7dda')}?"
+                f"{live_state.get('target_websocket_url') or 'webcast socket'} ? "
+                f"{tr('connections', '\u9023\u7dda\u6578')} {live_state.get('target_websocket_connection_count', 0)}"
             )
-            probe_error = ""
-        elif probe_error_text:
-            probe_result = tr("probe error", "探測錯誤")
-            probe_error = probe_error_text[:160]
-        elif pd.notna(last_probe) and pd.notna(last_confirmed_live) and last_probe == last_confirmed_live:
-            probe_result = tr("LIVE confirmed", "已確認開播")
-            probe_error = ""
-        elif pd.notna(last_probe):
-            probe_result = tr("LIVE not confirmed", "尚未確認開播")
-            probe_error = ""
         else:
-            probe_result = tr("no probe yet", "尚無探測紀錄")
-            probe_error = ""
-        probe_time_label = (
-            last_probe.tz_convert(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S")
-            if pd.notna(last_probe) else tr("not recorded", "尚無紀錄")
-        )
-        confirmed_time_label = (
-            last_confirmed_live.tz_convert(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S")
-            if pd.notna(last_confirmed_live) else tr("not recorded", "尚無紀錄")
-        )
-        st.caption(
-            f"{tr('Watcher LIVE probe (TikTokLive WebSocket)', 'Watcher LIVE 探測（TikTokLive WebSocket）')}：{probe_result} · "
-            f"{tr('last check', '最近檢查')} {probe_time_label} · "
-            f"{tr('last confirmed LIVE', '最近確認開播')} {confirmed_time_label}"
-            + (f" · {probe_error}" if probe_error else "")
-        )
+            st.caption(
+                f"{tr('Collector connection state', '\u64f7\u53d6\u9023\u7dda\u72c0\u614b')}?{socket_labels.get(socket_state, socket_state)}"
+            )
 
         gap_started_at_ms = live_state.get("current_gap_started_at_ms")
         current_gap = (
@@ -1749,6 +2279,57 @@ def render_lightweight_live_view(session_dir: Path, streamer_state: dict) -> boo
                 tr("Playback p95", "播報 p95"),
                 f"{tts_metrics['p95_event_to_playback_ms']} ms" if tts_metrics.get("p95_event_to_playback_ms") is not None else "N/A",
             )
+            gift_tts_columns = st.columns(5)
+            gift_tts_columns[0].metric(
+                tr("Gift failures", "\u79ae\u7269\u64ad\u5831\u5931\u6557"),
+                tts_metrics.get("gift_delivery_failures", 0),
+            )
+            gift_tts_columns[1].metric(
+                tr("Failure alerts", "\u5931\u6557\u63d0\u793a\u97f3"),
+                tts_metrics.get("gift_failure_alerts_played", 0),
+            )
+            gift_tts_columns[2].metric(
+                tr("Alert errors", "\u63d0\u793a\u97f3\u932f\u8aa4"),
+                tts_metrics.get("gift_failure_alert_errors", 0),
+            )
+            gift_tts_columns[3].metric(
+                tr("Pending Gift replays", "\u5f85\u91cd\u64ad\u79ae\u7269"),
+                tts_metrics.get("pending_gift_replay_count", 0),
+            )
+            gift_tts_columns[4].metric(
+                tr("Replay unavailable", "\u7121\u6cd5\u81ea\u52d5\u91cd\u64ad"),
+                tts_metrics.get("gift_replay_unavailable", 0),
+            )
+            load_cols = st.columns(6)
+            load_cols[0].metric(
+                tr("Queue peak", "\u4f47\u5217\u5c16\u5cf0"),
+                f"{tts_metrics.get('max_queue_depth', 0)} / {tts_metrics.get('queue_capacity', 0)}",
+            )
+            load_cols[1].metric(
+                tr("Full queue waits", "\u4f47\u5217\u6eff\u6642\u7b49\u5f85"),
+                tts_metrics.get("queue_full_waits", 0),
+            )
+            load_cols[2].metric(
+                tr("Offline fallback audio", "\u96e2\u7dda\u5099\u63f4\u97f3\u8a0a\u5408\u6210"),
+                tts_metrics.get("gift_offline_fallback_succeeded", 0),
+            )
+            load_cols[3].metric(
+                tr("Offline fallback errors", "\u96e2\u7dda\u5099\u63f4\u5931\u6557"),
+                tts_metrics.get("gift_offline_fallback_failures", 0),
+            )
+            load_cols[4].metric(
+                tr("Chat offline fallback", "\u804a\u5929\u96e2\u7dda\u5099\u63f4"),
+                tts_metrics.get("chat_offline_fallback_succeeded", 0),
+            )
+            load_cols[5].metric(
+                tr("Chat fallback errors", "\u804a\u5929\u5099\u63f4\u5931\u6557"),
+                tts_metrics.get("chat_offline_fallback_failures", 0),
+            )
+            if tts_metrics.get("gift_delivery_failures", 0):
+                st.warning(tr(
+                    "Some Gift announcements failed; see the Live TTS delivery stages for details.",
+                    "\u6709\u79ae\u7269\u64ad\u5831\u5931\u6557\uff1b\u8acb\u5230 Live TTS \u7684\u64ad\u5831\u968e\u6bb5\u67e5\u770b\u8a73\u60c5\u3002",
+                ))
             if tts_metrics.get("skipped"):
                 st.json(tts_metrics["skipped"])
 
@@ -1775,6 +2356,13 @@ def render_lightweight_live_view(session_dir: Path, streamer_state: dict) -> boo
                     use_container_width=True,
                     hide_index=True,
                 )
+        if is_browser and live_state.get("recent_members"):
+            st.subheader(tr("Recent entries", "最近進場觀眾"))
+            st.dataframe(
+                list(reversed(live_state["recent_members"])),
+                use_container_width=True,
+                hide_index=True,
+            )
 
     return st.toggle(
         tr("Load full historical charts and comparisons", "載入完整歷史圖表與比較"),
@@ -1798,7 +2386,8 @@ def render_session_catalog() -> None:
             modified_at = path.stat().st_mtime
         except OSError:
             modified_at = 0.0
-        candidates.append((path, "Collector", read_json(path / "session.json", {}), modified_at))
+        source = "Browser Network" if _is_browser_session(path) else "Collector"
+        candidates.append((path, source, session_metadata(path), modified_at))
 
     for path in benchmark_paths[:20]:
         try:
@@ -1811,7 +2400,7 @@ def render_session_catalog() -> None:
 
     candidates.sort(key=lambda item: item[3], reverse=True)
     visible = candidates[:20]
-    st.subheader(tr("Recent sessions", "近期場次"))
+    st.subheader(tr("Session capture history", "收集場次紀錄"))
     if not visible:
         st.info(tr("No recorded sessions yet.", "目前還沒有已記錄的場次。"))
         return
@@ -1819,7 +2408,11 @@ def render_session_catalog() -> None:
     rows = []
     benchmark_options = {}
     for path, source, metadata, _ in visible:
-        event_counts = metadata.get("event_counts") or {}
+        event_counts = (
+            metadata.get("event_counts")
+            or metadata.get("normalized_event_counts")
+            or {}
+        )
         started = (
             metadata.get("started_at_utc")
             or metadata.get("started_at_local")
@@ -1838,9 +2431,9 @@ def render_session_catalog() -> None:
             tr("Source", "來源"): source,
             tr("Status", "狀態"): status,
             tr("Started (Taiwan time)", "開始時間（台灣）"): started_label,
-            tr("Chats", "聊天"): event_counts.get("chat", "—"),
-            tr("Gifts", "禮物"): event_counts.get("gift", "—"),
-            tr("Viewer samples", "觀眾採樣"): event_counts.get("viewer", "—"),
+            tr("Chats", "聊天"): str(event_counts.get("chat", "—")),
+            tr("Gifts", "禮物"): str(event_counts.get("gift", "—")),
+            tr("Viewer samples", "觀眾採樣"): str(event_counts.get("viewer", "—")),
         })
         if source.startswith("LIVE session"):
             benchmark_label = f"{path.parent.name} · {path.name}"
@@ -1868,14 +2461,198 @@ def render_session_catalog() -> None:
             st.switch_page(live_sessions_page)
 
 
+def render_session_settlement(session_dir: Path) -> None:
+    """Show a read-only end-of-LIVE report for the selected archived session."""
+    session_metadata_row = session_metadata(session_dir)
+    if session_metadata_row.get("status") == "running":
+        st.info(tr(
+            "The settlement view is available after this capture ends. Use Overview and the event tabs while LIVE is running.",
+            "場次結束後即可查看結算；直播進行中請使用總覽與事件分頁。",
+        ))
+        return
+    try:
+        report = load_session_report(session_dir)
+    except Exception as error:
+        st.error(tr("Could not build the session report.", "無法產生場次報表。") + f" {error}")
+        return
+
+    events = report.get("events") or {}
+    counts = events.get("counts") or {}
+    timeline = report.get("timeline") or {}
+    users = report.get("users") or {}
+    tts = report.get("tts") or {}
+    tts_metrics = tts.get("metrics") or {}
+    live_end = report.get("live_end_detection") or {}
+
+    st.subheader(tr("Session settlement", "直播結束統整"))
+    live_end_status = live_end.get("status") or "NOT_OBSERVED"
+    if live_end_status == "LIVE_ENDED":
+        end_label = tr("LIVE ended", "已偵測直播結束")
+    elif live_end_status == "NOT_OBSERVED":
+        end_label = tr("End signal not observed", "未收到結束訊號")
+    else:
+        end_label = str(live_end_status)
+    duration_seconds = timeline.get("duration_seconds")
+    duration_label = (
+        f"{int(duration_seconds) // 3600}h {int(duration_seconds) % 3600 // 60}m"
+        if isinstance(duration_seconds, (int, float)) else "—"
+    )
+    summary_columns = st.columns(6)
+    summary_columns[0].metric(tr("LIVE end", "直播結束"), end_label)
+    summary_columns[1].metric(tr("Observed event span", "事件涵蓋時間"), duration_label)
+    summary_columns[2].metric(tr("Peak concurrent viewers", "最高同時觀眾"), events.get("peak_viewers") if events.get("peak_viewers") is not None else "—")
+    summary_columns[3].metric(tr("Chat messages", "聊天室訊息"), counts.get("chat", 0))
+    summary_columns[4].metric(tr("Member events", "Member／進場事件"), counts.get("member", 0))
+    summary_columns[5].metric(tr("Gift diamonds", "禮物鑽石"), f"{events.get('gift_diamonds', 0):,}")
+
+    timing_caption = [
+        f"{tr('LIVE ended at', '直播結束時間')}：{report.get('live_end_at') or '—'}",
+        f"{tr('Capture stopped at', '擷取停止時間')}：{report.get('ended_at') or '—'}",
+    ]
+    if report.get("post_end_capture_seconds") is not None:
+        timing_caption.append(
+            f"{tr('captured after end signal', '結束訊號後仍擷取')}：{report['post_end_capture_seconds'] / 60:.1f} {tr('min', '分鐘')}"
+        )
+    st.caption(" · ".join(timing_caption))
+
+    trend_rows = []
+    for phase in timeline.get("phases") or []:
+        trend_rows.append({
+            tr("Period", "時段"): phase.get("label"),
+            tr("Time (Taiwan)", "時間（台灣）"): f"{phase.get('from') or '—'} – {phase.get('to') or '—'}",
+            tr("Chat", "聊天"): phase.get("chat", 0),
+            tr("Member", "進場事件"): phase.get("members", 0),
+            tr("Average viewers", "平均觀眾"): phase.get("viewer_average"),
+            tr("Peak viewers", "最高觀眾"): phase.get("viewer_peak"),
+            tr("Gift items", "禮物數量"): phase.get("gift_quantity", 0),
+            tr("Diamonds", "鑽石"): phase.get("gift_diamonds", 0),
+            tr("Likes received", "收到的 Like"): phase.get("likes_received", 0),
+            tr("Cumulative Likes", "累計 Like"): phase.get("like_total_end"),
+        })
+    if trend_rows:
+        st.markdown(f"#### {tr('Audience and engagement by period', '分時段人數與互動')}")
+        st.dataframe(pd.DataFrame(trend_rows), use_container_width=True, hide_index=True)
+
+    viewer_cols = st.columns(7)
+    viewer_cols[0].metric(tr("Viewer samples", "觀眾數樣本"), counts.get("viewer", 0))
+    viewer_cols[1].metric(tr("Average viewers", "平均觀眾"), timeline.get("viewer_average") if timeline.get("viewer_average") is not None else "—")
+    viewer_cols[2].metric(tr("Median viewers", "觀眾中位數"), timeline.get("viewer_median") if timeline.get("viewer_median") is not None else "—")
+    viewer_cols[3].metric(tr("Last concurrent sample", "最後同時觀眾樣本"), events.get("last_viewers") if events.get("last_viewers") is not None else "—")
+    viewer_cols[4].metric(tr("Last total_user_count", "最後 total_user_count"), events.get("last_room_user_count") if events.get("last_room_user_count") is not None else "—")
+    viewer_cols[5].metric(tr("Likes received", "收到的 Like"), events.get("likes_received", 0))
+    viewer_cols[6].metric(tr("Last cumulative Likes", "最後累計 Like"), events.get("last_total_likes") if events.get("last_total_likes") is not None else "—")
+    st.caption(tr(
+        "total_user_count is a separate TikTok field and is not the concurrent viewer sample.",
+        "total_user_count 是 TikTok 的另一個欄位，不代表同時觀眾數。",
+    ))
+
+    gift_rows = report.get("gifts") or []
+    st.markdown(f"#### {tr('Gift detail', '禮物明細')}")
+    gift_frame = pd.DataFrame([
+        {
+            tr("Gift ID", "Gift ID"): row.get("gift_id"),
+            tr("Gift name", "名稱"): row.get("display_name"),
+            tr("Items", "數量"): row.get("quantity", 0),
+            tr("Diamonds", "鑽石"): row.get("diamonds", 0),
+            tr("Mapping", "名稱對照"): tr("Mapped", "已對照") if row.get("catalog_status") == "mapped" else tr("Needs review", "待確認"),
+        }
+        for row in gift_rows
+    ])
+    if not gift_frame.empty:
+        total_row = {
+            tr("Gift ID", "Gift ID"): tr("Total", "合計"),
+            tr("Gift name", "名稱"): f"{len(gift_rows)} {tr('types', '種')}",
+            tr("Items", "數量"): events.get("gift_item_quantity", 0),
+            tr("Diamonds", "鑽石"): events.get("gift_diamonds", 0),
+            tr("Mapping", "名稱對照"): "",
+        }
+        gift_frame = pd.concat([gift_frame, pd.DataFrame([total_row])], ignore_index=True)
+        st.dataframe(gift_frame, use_container_width=True, hide_index=True)
+    else:
+        st.info(tr("No Gift events were captured in this session.", "這場沒有捕獲到禮物事件。"))
+
+    donor_rows = users.get("top_gifters") or []
+    if donor_rows:
+        st.markdown(f"#### {tr('Top Gifters', '送禮者排行')}")
+        donor_frame = pd.DataFrame([
+            {
+                tr("User ID", "使用者 ID"): f"@{row.get('user')}",
+                tr("Nickname", "暱稱"): row.get("nickname") or "—",
+                tr("Gift events", "送禮事件"): row.get("gift_events", 0),
+                tr("Gift items", "禮物數量"): row.get("quantity", 0),
+                tr("Gift types", "Gift 種類"): row.get("gift_ids", 0),
+                tr("Diamonds", "鑽石"): row.get("diamonds", 0),
+            }
+            for row in donor_rows
+        ])
+        st.dataframe(donor_frame, use_container_width=True, hide_index=True)
+
+    profile_counts = users.get("profile_field_counts") or {}
+    profile_rows = []
+    for event_type, label in (("chat", tr("Chat", "聊天")), ("gift", tr("Gift", "禮物")), ("member", "Member／進場")):
+        row = profile_counts.get(event_type) or {}
+        profile_rows.append({
+            tr("Event type", "事件類型"): label,
+            tr("Events", "事件數"): row.get("events", 0),
+            tr("Has user grade", "含使用者等級"): row.get("user_grade", 0),
+            tr("Has fan-club level", "含粉絲團等級"): row.get("fan_club", 0),
+        })
+    if profile_rows:
+        st.markdown(f"#### {tr('User fields carried by events', '事件帶到的使用者資料')}")
+        st.dataframe(pd.DataFrame(profile_rows), use_container_width=True, hide_index=True)
+        st.caption(tr(
+            "Missing fields mean TikTok did not include them in that event. The session contains fan-club levels but no independent iron-fan flag.",
+            "欄位缺少表示 TikTok 該筆事件未提供；本場有粉絲團等級，但沒有獨立的鐵粉標記。",
+        ))
+
+    rank_rows = report.get("latest_rank_snapshot") or []
+    if rank_rows:
+        st.markdown(f"#### {tr('Latest TikTok ranking snapshot', '最後一次收到的 TikTok 排名資料')}")
+        st.dataframe(pd.DataFrame(rank_rows), use_container_width=True, hide_index=True)
+        st.caption(tr("This shows the ranks array carried by the event, not a guaranteed complete leaderboard.", "此表呈現事件所帶的 ranks 陣列，不保證是完整排行榜。"))
+
+    if tts_metrics:
+        st.markdown(f"#### {tr('TTS from this session', '本場 TTS 結果')}")
+        tts_columns = st.columns(6)
+        tts_columns[0].metric(tr("Chat spoken", "聊天播出"), f"{tts_metrics.get('chat_spoken', 0)} / {tts_metrics.get('chat_events_seen', 0)}")
+        tts_columns[1].metric(tr("Gift spoken", "禮物播出"), f"{tts_metrics.get('gift_spoken', 0)} / {tts_metrics.get('gift_queued', 0)}")
+        tts_columns[2].metric(tr("Gift failures", "禮物失敗"), tts_metrics.get("gift_delivery_failures", 0))
+        tts_columns[3].metric(tr("Playback P50", "播報 P50"), f"{tts_metrics.get('p50_event_to_playback_ms', '—')} ms")
+        tts_columns[4].metric(tr("Playback P95", "播報 P95"), f"{tts_metrics.get('p95_event_to_playback_ms', '—')} ms")
+        tts_columns[5].metric(tr("Worker", "Worker"), tts.get("status") or "—")
+        if tts_metrics.get("gift_delivery_failures") and not tts.get("gift_delivery_log"):
+            st.warning(tr(
+                "Gift failures are counted, but this session has no per-event delivery log to identify the failed Gift IDs.",
+                "有記錄禮物播報失敗數，但場次中沒有逐筆投遞紀錄，無法指出失敗的 Gift ID。",
+            ))
+
+    st.caption(
+        f"{tr('Unique chatters', '不重複聊天帳號')}：{users.get('unique_chatters', 0)} · "
+        f"{tr('Unique Gifters', '不重複送禮帳號')}：{users.get('unique_gifters', 0)} · "
+        f"{tr('Likes updated', 'Like 更新')}：{counts.get('like', 0)} · "
+        f"{tr('Last total Likes', '最後總 Like 數')}：{events.get('last_total_likes') if events.get('last_total_likes') is not None else '—'}"
+    )
+
+
 def render_dashboard():
     config = read_json(CONFIG_PATH, {"streamers": []})
-    state = read_json(WATCHER_STATE, {"streamers": {}})
+    state = {}
     streamers = [
         str(item.get("username", "")).lstrip("@")
         for item in config.get("streamers", [])
         if item.get("username")
     ]
+    active_browser_streamers = [
+        str(session_metadata(path).get("username") or "").lstrip("@")
+        for path in active_browser_session_dirs()
+        if session_metadata(path).get("username")
+    ]
+    historical_streamers = [
+        str(session_metadata(path).get("username") or "").lstrip("@")
+        for path in session_dirs()
+        if session_metadata(path).get("username")
+    ]
+    analysis_streamers = list(dict.fromkeys([*active_browser_streamers, *streamers, *historical_streamers]))
     states = state.get("streamers", {})
 
     st.title(tr("TikTok LIVE Analytics", "TikTok 直播分析"))
@@ -1885,92 +2662,30 @@ def render_dashboard():
             f"所有時間皆為台灣時間（Asia/Taipei）；即時資料每 {LIVE_REFRESH_SECONDS} 秒更新。",
         )
     )
-    quota_until = state.get("quota_pause_until_utc")
-    if quota_until:
-        quota_time = pd.to_datetime(quota_until, utc=True, errors="coerce")
-        if pd.notna(quota_time) and quota_time > pd.Timestamp.now(tz="UTC"):
-            st.warning(
-                tr(
-                    "TikTool quota cooldown: new LIVE checks and Collector starts are paused until ",
-                    "TikTool 配額冷卻中：暫停新直播探測與 Collector 啟動至 ",
-                )
-                + quota_time.tz_convert(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M")
-                + f" {tr('Taiwan time', '台灣時間')}"
-                + tr(". Existing collection connections are unaffected.", "。已正常運作的收集連線不受影響。")
-            )
-
     with st.sidebar:
-        st.header(tr("Watch control", "監控控制"))
-        pid = watcher_pid()
-        running = pid_is_running(pid)
-        benchmark_collecting = bool(active_benchmark_session_dirs())
-        watcher_sdk_available = watcher_python() is not None
-        st.write(f"Watcher：**{tr('RUNNING', '執行中') if running else tr('STOPPED', '已停止')}**")
-        if pid:
-            st.caption(f"PID: {pid}")
-        if benchmark_collecting:
-            st.caption(
-                tr("A LIVE session is collecting. Open Live Sessions to inspect it; starting the legacy Watcher would open another TikTok connection.", "直播場次正在收集中。請到「直播場次」檢視；啟動舊版 Watcher 會建立另一條 TikTok 連線。")
+        st.caption(
+            tr(
+                "LIVE capture comes from the Browser Network session you started in Chrome.",
+                "??????? Chrome ??? Browser Network ?????",
             )
-        elif not watcher_sdk_available:
-            st.caption(
-                tr(
-                    "Watcher is unavailable because no Python environment with TikTokLive was found.",
-                    "找不到已安裝 TikTokLive 的 Python 環境，Watcher 目前無法啟動。",
-                )
-            )
-        else:
-            st.caption(
-                tr(
-                    "Watcher checks LIVE status only; it will not start a Collector session.",
-                    "Watcher 只探測開播狀態，不會啟動 Collector 場次。",
-                )
-            )
-        if st.button(
-            tr("Start watcher", "啟動 Watcher"),
-            disabled=running or benchmark_collecting or not watcher_sdk_available,
-            use_container_width=True,
-        ):
-            st.success(start_watcher())
-            st.rerun()
-        if st.button(tr("Stop watcher", "停止 Watcher"), disabled=not running, use_container_width=True):
-            st.warning(stop_watcher())
-            st.rerun()
-
-        st.divider()
-        st.header(tr("Track a streamer", "管理直播主"))
-        new_streamer = st.text_input(
-            tr("Streamer username", "直播主帳號"),
-            placeholder="@username",
-            key="new_streamer_username",
         )
-        if st.button(tr("Add / enable streamer", "新增／啟用直播主"), use_container_width=True):
-            st.success(add_streamer_to_watchlist(new_streamer))
-            st.rerun()
-
-        configured_streamers = [value for value in streamers if value]
-        remove_streamer = st.selectbox(
-            tr("Remove streamer", "移除直播主"),
-            options=configured_streamers or [""],
-            format_func=lambda value: f"@{value}" if value else tr("No streamer", "沒有直播主"),
-            key="remove_streamer_username",
-        )
-        if st.button(
-            tr("Remove from watchlist", "從追蹤清單移除"),
-            disabled=not remove_streamer,
-            use_container_width=True,
-        ):
-            st.warning(remove_streamer_from_watchlist(remove_streamer))
-            st.rerun()
-
         st.divider()
         st.header(tr("Session analysis", "場次分析"))
         username = st.selectbox(
             tr("Streamer", "直播主"),
-            options=streamers or [""],
+            options=analysis_streamers or [""],
             format_func=lambda value: f"@{value}" if value else tr("No streamer", "沒有直播主"),
             key="analysis_username",
         )
+        previous_username = st.session_state.get("_dashboard_previous_analysis_username")
+        if previous_username != username:
+            st.session_state["_dashboard_previous_analysis_username"] = username
+            for dependent_key in (
+                "analysis_manual_id",
+                "analysis_selected_id",
+                "comparison_session_ids",
+            ):
+                st.session_state.pop(dependent_key, None)
         tracking_dir = latest_live_session(username)
         manual_id = st.text_input(
             tr("Session ID or room ID (optional)", "Session ID 或直播間 ID（選填）"),
@@ -2011,15 +2726,15 @@ def render_dashboard():
         )
         if manual_id.strip():
             st.caption(tr("Manual Session ID overrides the dropdown.", "手動輸入的 Session ID 優先於下拉選單。"))
-        st.caption(f"{tr('Session data', '場次資料')}：{RAW_ROOT} · {BENCHMARK_ROOT}")
+        st.caption(f"{tr('Session data', '場次資料')}：{RAW_ROOT} · {BENCHMARK_ROOT} · {BROWSER_PROBE_ROOT}")
 
-    render_session_catalog()
+    with st.expander(tr("Recent sessions", "\u6700\u8fd1\u5834\u6b21"), expanded=False):
+        render_session_catalog()
 
     if not username:
         st.warning(tr("No enabled streamer configured.", "尚未設定已啟用的直播主。"))
         return
 
-    render_current_connection_status(username, states.get(username, {}))
     session_dir = resolve_session(manual_id, username, selected_id)
     if manual_id.strip() and session_dir is None:
         st.error(f"{tr('Session ID / room ID not found', '找不到 Session ID／直播間 ID')}：{manual_id.strip()}")
@@ -2036,6 +2751,17 @@ def render_dashboard():
 
     metrics = load_session(session_dir)
     session = metrics["session"] or {}
+    session_provider = session.get("provider") or ("browser_network" if _is_browser_session(session_dir) else None)
+    viewer_correction_pending = False
+    viewer_correction_required = False
+    viewer_correction_key = f"browser_viewer_correction_requested_{session_dir.name}"
+    request_viewer_correction = bool(st.session_state.get(viewer_correction_key, False))
+    if session_provider == "browser_network" and session.get("status") != "running":
+        metrics, viewer_correction_pending, viewer_correction_required = _correct_browser_metrics(
+            metrics,
+            [session_dir],
+            request_correction=request_viewer_correction,
+        )
     streamer_state = states.get(username, {})
     tracking_room_id = (session_metadata(tracking_dir) or {}).get("room_id") if tracking_dir else None
     tracking_fragments = room_session_dirs(username, tracking_room_id) if tracking_dir else []
@@ -2043,10 +2769,26 @@ def render_dashboard():
     selected_room_id = session.get("room_id")
     selected_fragments = room_session_dirs(username, selected_room_id)
     selected_room_metrics = combine_session_metrics(selected_fragments, session_dir) if selected_fragments else metrics
+    if session_provider == "browser_network" and session.get("status") != "running":
+        selected_room_metrics, room_viewer_correction_pending, room_viewer_correction_required = _correct_browser_metrics(
+            selected_room_metrics,
+            selected_fragments or [session_dir],
+            request_correction=request_viewer_correction,
+        )
+        viewer_correction_pending = viewer_correction_pending or room_viewer_correction_pending
+        viewer_correction_required = viewer_correction_required or room_viewer_correction_required
     if tracking_dir and session_dir == tracking_dir and not manual_id.strip():
         display_metrics = tracking_metrics
     else:
         display_metrics = selected_room_metrics
+        viewer_correction_pending = bool(
+            viewer_correction_pending
+            or selected_room_metrics.get("viewer_correction_pending")
+        )
+        viewer_correction_required = bool(
+            viewer_correction_required
+            or selected_room_metrics.get("viewer_correction_required")
+        )
     comparison_paths = [
         path for session_id in comparison_ids
         for path in available
@@ -2071,16 +2813,55 @@ def render_dashboard():
 
     if tracking_dir and session_dir == tracking_dir:
         st.success(f"{tr('LIVE collection active', '直播收集中')} - {tracking_dir.name}")
-    elif metrics["viewer_rows"]:
+    elif metrics["viewer_rows"] or viewer_correction_pending or viewer_correction_required:
         st.info(tr("Historical session analysis - no active LIVE collector for this streamer.", "歷史場次分析；此直播主目前沒有運作中的 LIVE Collector。"))
     else:
         st.warning(tr("This session contains system logs only. Select a session labeled analytics to display trends.", "此場次只有系統紀錄。請選擇標示為 analytics 的場次查看趨勢。"))
 
     st.markdown(f"#### {tr('Audience', '觀眾概況')}")
     audience_cols = st.columns(4)
-    audience_cols[0].metric(tr("Tracking status", "追蹤狀態"), streamer_state.get("status", "unknown"))
-    audience_cols[1].metric(tr("Current viewers", "目前觀眾數"), display_metrics["viewers"][-1] if display_metrics["viewers"] else "N/A")
-    audience_cols[2].metric(tr("Peak viewers", "最高觀眾數"), max(display_metrics["viewers"]) if display_metrics["viewers"] else "N/A")
+    if session_provider == "browser_network":
+        capture_status = "LIVE" if session.get("status") == "running" else tr("Capture ended", "\u64f7\u53d6\u5df2\u7d50\u675f")
+        audience_cols[0].metric(tr("Capture status", "\u64f7\u53d6\u72c0\u614b"), capture_status)
+        audience_cols[1].metric(
+            tr("Latest viewer sample", "\u6700\u65b0\u89c0\u773e\u6578\u6a23\u672c"),
+            display_metrics["viewers"][-1]
+            if display_metrics["viewers"]
+            else tr("Correcting...", "\u6b63\u5728\u6821\u6b63") if viewer_correction_pending
+            else tr("Needs correction", "\u5f85\u6821\u6b63") if viewer_correction_required
+            else "N/A",
+            help=tr(
+                "Most recent WebcastRoomUserSeqMessage sample received by Chrome CDP. It updates when TikTok sends a new sample.",
+                "Chrome CDP \u6700\u8fd1\u6536\u5230\u7684 WebcastRoomUserSeqMessage \u6a23\u672c\uff1bTikTok \u50b3\u4f86\u65b0\u6a23\u672c\u6642\u624d\u66f4\u65b0\u3002",
+            ),
+        )
+    else:
+        audience_cols[0].metric(tr("Tracking status", "\u8ffd\u8e64\u72c0\u614b"), streamer_state.get("status", "unknown"))
+        audience_cols[1].metric(tr("Latest viewer sample", "\u6700\u65b0\u89c0\u773e\u6578\u6a23\u672c"), display_metrics["viewers"][-1] if display_metrics["viewers"] else "N/A")
+    audience_cols[2].metric(
+        tr("Peak viewers", "最高觀眾數"),
+        max(display_metrics["viewers"])
+        if display_metrics["viewers"]
+        else tr("Correcting...", "\u6b63\u5728\u6821\u6b63") if viewer_correction_pending
+        else tr("Needs correction", "\u5f85\u6821\u6b63") if viewer_correction_required
+        else "N/A",
+    )
+    if viewer_correction_pending:
+        st.info(tr(
+            "Accurate Browser viewer samples are being rebuilt from the captured frames. Other dashboard sections are ready while this runs.",
+            "\u6b63\u5728\u5f9e\u5df2\u4fdd\u5b58\u7684\u5f71\u683c\u91cd\u5efa\u6b63\u78ba\u7684\u700f\u89bd\u5668\u89c0\u773e\u6578\uff1b\u8655\u7406\u671f\u9593\u5176\u4ed6\u5100\u8868\u677f\u5167\u5bb9\u4ecd\u53ef\u4f7f\u7528\u3002",
+        ))
+    elif viewer_correction_required:
+        st.info(tr(
+            "This archived session has viewer samples that need raw-frame correction. The dashboard stays responsive until you request it.",
+            "此場次的觀眾樣本需要從原始影格校正；在你啟動校正前，儀表板會保持即時可操作。",
+        ))
+        if st.button(
+            tr("Correct archived viewer samples", "校正封存觀眾人數"),
+            key=f"{viewer_correction_key}_button",
+        ):
+            st.session_state[viewer_correction_key] = True
+            st.rerun()
     audience_cols[3].metric(tr("Join events", "進場事件"), display_metrics["joins"])
 
     st.markdown(f"#### {tr('Engagement & captured value', '互動與收集數據')}")
@@ -2100,107 +2881,121 @@ def render_dashboard():
             + f" {display_metrics['like_baseline_estimate']}."
         )
 
-    tab_tracking, tab_overview, tab_chat, tab_compare, tab_gifts, tab_traffic, tab_snapshots, tab_health, tab_quality = st.tabs(
+    tab_overview, tab_chat, tab_gifts, tab_compare, tab_audience, tab_more, tab_settlement = st.tabs(
         [
-            tr("Live tracking", "即時監控"), tr("Trends", "趨勢"), tr("Recent chat", "最新聊天"), tr("Multi-session", "多場次比較"),
-            tr("Gifts", "禮物"), tr("Traffic & social", "人流與社群"), tr("Snapshots & rankings", "快照與排行"), tr("System health", "系統健康狀態"), tr("Data quality", "資料品質"),
-        ]
+            tr("Overview", "\u7e3d\u89bd"),
+            tr("Chat", "\u804a\u5929"),
+            tr("Gifts", "\u79ae\u7269"),
+            tr("Compare", "\u6bd4\u8f03"),
+            tr("Audience & social", "\u89c0\u773e\u8207\u793e\u7fa4"),
+            tr("Rankings & health", "\u6392\u884c\u8207\u7cfb\u7d71"),
+            tr("Session settlement", "場次結算"),
+        ],
+        key="dashboard_analysis_tabs",
+        on_change="rerun",
     )
-    with tab_tracking:
-        render_live_tracking(tracking_dir, tracking_metrics, streamer_state)
+    if tab_overview.open:
+        with tab_overview:
+            render_live_tracking(tracking_dir, tracking_metrics, streamer_state)
 
-    with tab_overview:
-        if not metrics["viewer_rows"] and not metrics["activity_rows"]:
-            st.warning(tr("No timestamped analytics events are available in this session.", "此場次沒有含時間戳記的分析事件。"))
-        else:
-            trend_cols = st.columns(3)
-            trend_cols[0].metric(tr("Viewer samples", "觀眾採樣"), len(metrics["viewer_rows"]))
-            trend_cols[1].metric(tr("Captured events", "捕獲事件"), sum(metrics["counts"].values()))
-            trend_cols[2].metric(tr("Event categories", "事件類別"), len([value for value in metrics["counts"].values() if value]))
-        st.subheader(tr("Viewer trend", "觀眾趨勢"))
-        render_viewer_chart(metrics["viewer_rows"])
-        st.subheader(tr("Activity trend by event type", "依事件類型查看互動趨勢"))
-        render_activity_chart(metrics["activity_rows"])
-        counts_frame = pd.DataFrame(
-            [{"event_type": key, "events": value} for key, value in metrics["counts"].most_common()]
-        )
-        if not counts_frame.empty:
-            st.subheader(tr("Captured event breakdown", "捕獲事件統計"))
-            st.dataframe(counts_frame, use_container_width=True, hide_index=True)
-
-    with tab_chat:
-        show_dashboard_chat = st.toggle(
-            tr("Show recent chat list", "顯示最新聊天清單"), value=True, key="dashboard_show_recent_chat"
-        )
-        chat_limit = int(
-            st.number_input(
-                tr("Latest messages to show", "顯示最新訊息筆數"),
-                min_value=1,
-                max_value=200,
-                value=30,
-                step=1,
-                key="dashboard_recent_chat_limit",
+            st.markdown(f"#### {tr('Viewer and activity trends', '\u89c0\u773e\u8207\u4e92\u52d5\u8da8\u52e2')}")
+            if not metrics["viewer_rows"] and not metrics["activity_rows"]:
+                st.warning(tr("No timestamped analytics events are available in this session.", "此場次沒有含時間戳記的分析事件。"))
+            else:
+                trend_cols = st.columns(3)
+                trend_cols[0].metric(
+                    tr("Viewer samples", "觀眾採樣"),
+                    tr("Correcting...", "\u6b63\u5728\u6821\u6b63")
+                    if metrics.get("viewer_correction_pending")
+                    else tr("Needs correction", "\u5f85\u6821\u6b63")
+                    if metrics.get("viewer_correction_required")
+                    else len(metrics["viewer_rows"]),
+                )
+                trend_cols[1].metric(tr("Captured events", "捕獲事件"), sum(metrics["counts"].values()))
+                trend_cols[2].metric(tr("Event categories", "事件類別"), len([value for value in metrics["counts"].values() if value]))
+            st.subheader(tr("Viewer trend", "觀眾趨勢"))
+            if metrics.get("viewer_correction_pending"):
+                st.info(tr(
+                    "The archived Browser viewer samples are being corrected from their raw frames. This view will update automatically when ready.",
+                    "\u6b63\u5728\u4f7f\u7528\u539f\u59cb\u5f71\u683c\u6821\u6b63\u5df2\u5c01\u5b58\u7684\u89c0\u773e\u4eba\u6578\uff1b\u5b8c\u6210\u5f8c\u6b64\u5716\u8868\u6703\u81ea\u52d5\u66f4\u65b0\u3002",
+                ))
+            elif metrics.get("viewer_correction_required"):
+                st.info(tr(
+                    "Use Correct archived viewer samples above to rebuild this chart from the saved raw frames.",
+                    "請使用上方的「校正封存觀眾人數」按鈕，從已保存的原始影格重建圖表。",
+                ))
+            else:
+                render_viewer_chart(metrics["viewer_rows"])
+            st.subheader(tr("Activity trend by event type", "依事件類型查看互動趨勢"))
+            render_activity_chart(metrics["activity_rows"])
+            counts_frame = pd.DataFrame(
+                [{"event_type": key, "events": value} for key, value in metrics["counts"].most_common()]
             )
-        )
-        if not show_dashboard_chat:
-            st.caption(tr("Recent chat list is hidden.", "最新聊天清單已隱藏。"))
-        elif metrics["recent_chat"]:
-            st.dataframe(
-                metrics["recent_chat"][:chat_limit],
-                use_container_width=True,
-                hide_index=True,
+            if not counts_frame.empty:
+                st.subheader(tr("Captured event breakdown", "捕獲事件統計"))
+                st.dataframe(counts_frame, use_container_width=True, hide_index=True)
+
+    if tab_chat.open:
+        with tab_chat:
+            show_dashboard_chat = st.toggle(
+                tr("Show recent chat list", "顯示最新聊天清單"), value=True, key="dashboard_show_recent_chat"
             )
-        else:
-            st.info(tr("No chat messages in this session.", "此場次沒有聊天訊息。"))
+            chat_limit = int(
+                st.number_input(
+                    tr("Latest messages to show", "顯示最新訊息筆數"),
+                    min_value=1,
+                    max_value=200,
+                    value=30,
+                    step=1,
+                    key="dashboard_recent_chat_limit",
+                )
+            )
+            if not show_dashboard_chat:
+                st.caption(tr("Recent chat list is hidden.", "最新聊天清單已隱藏。"))
+            elif metrics["recent_chat"]:
+                st.dataframe(
+                    metrics["recent_chat"][:chat_limit],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.info(tr("No chat messages in this session.", "此場次沒有聊天訊息。"))
 
-    with tab_compare:
-        render_compare_tab(comparison_paths)
+    if tab_compare.open:
+        with tab_compare:
+            render_compare_tab(comparison_paths)
 
-    with tab_gifts:
-        render_gift_tab(comparison_paths)
+    if tab_gifts.open:
+        with tab_gifts:
+            render_gift_tab(comparison_paths)
 
-    with tab_traffic:
-        render_traffic_social_tab(comparison_paths)
+    if tab_audience.open:
+        with tab_audience:
+            render_traffic_social_tab(comparison_paths)
 
-    with tab_snapshots:
-        render_snapshots_tab(comparison_paths)
+    if tab_more.open:
+        with tab_more:
+            render_snapshots_tab(comparison_paths)
+            render_health_tab(comparison_paths)
 
-    with tab_health:
-        render_health_tab(comparison_paths)
+            quality = session.get("data_quality", {})
+            st.json({
+                "session_id": session.get("session_id", session_dir.name),
+                "status": session.get("status"),
+                "collector_started_at_local": session.get("collector_started_at_local"),
+                "collector_ended_at_local": session.get("collector_ended_at_local"),
+                "last_received_at_local": session.get("last_received_at_local") or local_timestamp(session.get("last_received_at_utc")),
+                "socket_uptime_ratio": quality.get("socket_uptime_ratio"),
+                "socket_gap_seconds": quality.get("socket_gap_seconds"),
+                "duplicate_events_dropped": quality.get("duplicate_events_dropped"),
+                "sdk_error_events": quality.get("sdk_error_events"),
+            })
 
-    with tab_quality:
-        quality = session.get("data_quality", {})
-        st.json({
-            "session_id": session.get("session_id", session_dir.name),
-            "status": session.get("status"),
-            "collector_started_at_local": session.get("collector_started_at_local"),
-            "collector_ended_at_local": session.get("collector_ended_at_local"),
-            "last_received_at_local": session.get("last_received_at_local") or local_timestamp(session.get("last_received_at_utc")) ,
-            "socket_uptime_ratio": quality.get("socket_uptime_ratio"),
-            "socket_gap_seconds": quality.get("socket_gap_seconds"),
-            "duplicate_events_dropped": quality.get("duplicate_events_dropped"),
-            "sdk_error_events": quality.get("sdk_error_events"),
-            "last_probe_error": streamer_state.get("last_probe_error"),
-        })
+    if tab_settlement.open:
+        with tab_settlement:
+            render_session_settlement(session_dir)
 
     st.divider()
-    log_header, log_control = st.columns([4, 1])
-    log_header.subheader(tr("Watcher log (latest)", "Watcher 最新紀錄"))
-    log_limit = log_control.number_input(
-        tr("Lines", "顯示行數"),
-        min_value=1,
-        max_value=1000,
-        value=10,
-        step=10,
-        key="watcher_log_line_limit",
-    )
-    try:
-        log_lines = read_tail_lines(WATCHER_LOG, log_limit)
-        st.code("\n".join(log_lines) or "(empty)")
-    except OSError:
-        st.info(tr("Watcher log is not available.", "無法讀取 Watcher 紀錄。"))
-
-
 @st.fragment(run_every=LIVE_REFRESH_SECONDS)
 def render_dashboard_page():
     render_dashboard()
@@ -2220,6 +3015,12 @@ def render_live_tts_page():
         for item in config.get("streamers", [])
         if item.get("username")
     ]
+    active_browser_streamers = [
+        str(session_metadata(path).get("username") or "").lstrip("@")
+        for path in active_browser_session_dirs()
+        if session_metadata(path).get("username")
+    ]
+    streamers = list(dict.fromkeys([*active_browser_streamers, *streamers]))
     import app.tts_ui as tts_ui
     tts_ui = importlib.reload(tts_ui)
     tts_ui.render_tts(streamers, state.get("streamers", {}))
@@ -2232,8 +3033,12 @@ def render_reports_page():
         for item in config.get("streamers", [])
         if item.get("username")
     ]
+    streamers = list(dict.fromkeys(
+        [*streamers]
+        + [str(session_metadata(path).get("username") or "").lstrip("@") for path in session_dirs()]
+    ))
     from app.report_runtime import load_reports_ui
-    load_reports_ui().render_reports([RAW_ROOT, BENCHMARK_ROOT], streamers)
+    load_reports_ui().render_reports([RAW_ROOT, BENCHMARK_ROOT, BROWSER_PROBE_ROOT], streamers)
 
 
 def render_chat_sender_page():

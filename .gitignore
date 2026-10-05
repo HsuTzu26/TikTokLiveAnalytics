@@ -1,6 +1,7 @@
 # Python environments and caches
 .venv/
 .venv_tiktoklive/
+.venv_tts_eval_*/
 __pycache__/
 *.py[cod]
 .pytest_cache/

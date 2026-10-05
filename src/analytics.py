@@ -478,23 +478,44 @@ def ranking_history(session_dirs: list[Path]):
                 yield from lists(child)
 
     for session_dir in session_dirs:
-        path = session_dir / "rankings.ndjson"
+        rankings_path = session_dir / "rankings.ndjson"
+        events_path = session_dir / "events.ndjson"
+        path = (
+            rankings_path
+            if rankings_path.exists() and rankings_path.stat().st_size > 0
+            else events_path
+        )
         if not path.exists():
             continue
         with path.open("r", encoding="utf-8", errors="replace") as fp:
             for line in fp:
                 try:
-                    snapshot = json.loads(line)
+                    item = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                for board, entries in lists(snapshot.get("data") or {}):
+                if not isinstance(item, dict):
+                    continue
+                if path == events_path:
+                    if item.get("type") != "viewer":
+                        continue
+                    data = {"ranks": item.get("ranks")}
+                    captured_at = (
+                        item.get("received_at_local")
+                        or item.get("received_at_utc")
+                        or item.get("timestamp_local")
+                        or item.get("timestamp_utc")
+                    )
+                else:
+                    data = item.get("data") or {}
+                    captured_at = item.get("captured_at_local") or item.get("captured_at_utc")
+                for board, entries in lists(data):
                     for position, entry in enumerate(entries, 1):
                         if not isinstance(entry, dict):
                             continue
                         user = entry.get("user") if isinstance(entry.get("user"), dict) else {}
                         rows.append({
                             "session_id": session_dir.name,
-                            "time": snapshot.get("captured_at_local") or snapshot.get("captured_at_utc"),
+                            "time": captured_at,
                             "board": board,
                             "rank": entry.get("rank") or position,
                             "user": user.get("display_id") or user.get("uniqueId") or user.get("nickname") or entry.get("user_name"),
